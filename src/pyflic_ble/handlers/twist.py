@@ -11,9 +11,14 @@ import time
 
 from ..const import (
     COMMAND_TIMEOUT,
+    EVENT_TYPE_CLICK,
+    EVENT_TYPE_DOUBLE_CLICK,
+    EVENT_TYPE_DOWN,
+    EVENT_TYPE_HOLD,
     EVENT_TYPE_ROTATE_CLOCKWISE,
     EVENT_TYPE_ROTATE_COUNTER_CLOCKWISE,
     EVENT_TYPE_SELECTOR_CHANGED,
+    EVENT_TYPE_UP,
     FIRMWARE_DATA_CHUNK_SIZE,
     FIRMWARE_FINAL_ACK_TIMEOUT,
     FIRMWARE_HEADER_SIZE,
@@ -387,11 +392,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 if i == 12:
                     config = TwistModeConfig(
                         led_mode=3,  # SDK default
-                        has_click=False,
-                        has_double_click=False,
+                        has_click=True,
+                        has_double_click=True,
                         extra_leds_after=0,
                         position=0,
-                        timeout_seconds=0,
+                        timeout_seconds=60,
                     )
                 else:
                     config = TwistModeConfig(
@@ -408,23 +413,23 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             for _ in range(13):
                 config = TwistModeConfig(
                     led_mode=2,  # Continuous LED mode
-                    has_click=False,
-                    has_double_click=False,
+                    has_click=True,
+                    has_double_click=True,
                     extra_leds_after=0,
                     position=0,
-                    timeout_seconds=0,
+                    timeout_seconds=60,
                 )
                 mode_configs.append(config)
         else:
-            # Default mode: basic rotation without click events
+            # Default mode: basic rotation with click events
             for _ in range(13):
                 config = TwistModeConfig(
                     led_mode=1,  # SDK default
-                    has_click=False,
-                    has_double_click=False,
+                    has_click=True,
+                    has_double_click=True,
                     extra_leds_after=0,
                     position=0,
-                    timeout_seconds=0,
+                    timeout_seconds=60,
                 )
                 mode_configs.append(config)
 
@@ -587,6 +592,41 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             rotate_events = self._parse_twist_rotation_event(data)
 
         return button_events, rotate_events, selector_change
+
+    # Twist base-type lookup (bits [1:0] of event_encoded)
+    _TWIST_BASE_TYPE_MAP: dict[int, str] = {
+        0: EVENT_TYPE_UP,
+        1: EVENT_TYPE_DOWN,
+        2: EVENT_TYPE_CLICK,
+        3: EVENT_TYPE_HOLD,
+    }
+
+    def _get_event_name(self, event_type: int) -> str:
+        """Get human-readable name for Twist event_encoded value."""
+        base = event_type & 0x03
+        base_names = {0: "UP", 1: "DOWN", 2: "SINGLE_CLICK_TIMEOUT", 3: "HOLD"}
+        name = base_names.get(base, f"UNKNOWN_BASE({base})")
+        if event_type & 0x04:
+            name += "+SECOND"
+        if event_type & 0x08:
+            name += "+DBL"
+        return name
+
+    def _map_event_type(self, event_type: int) -> str | None:
+        """Map Twist event_encoded to HA event type.
+
+        Twist encodes button events in 4 bits:
+          bits [1:0] = base type (0=UP, 1=DOWN, 2=SINGLE_CLICK_TIMEOUT, 3=HOLD)
+          bit 2      = conflated flag (second press / quick / also_single_click_first)
+          bit 3      = dbl (this UP concludes a double-click)
+        """
+        if event_type & 0x08:  # bit 3 set → double-click concluding release
+            base = event_type & 0x03
+            if base == 0:  # UP + dbl
+                return EVENT_TYPE_DOUBLE_CLICK
+            # DOWN/other + dbl: treat as the base type
+            return self._TWIST_BASE_TYPE_MAP.get(base)
+        return self._TWIST_BASE_TYPE_MAP.get(event_type & 0x03)
 
     def _parse_twist_button_events(
         self, event_data: bytes
