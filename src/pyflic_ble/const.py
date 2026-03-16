@@ -129,6 +129,9 @@ FLIC2_EVENT_UP_SINGLE_CLICK: Final = 10
 FLIC2_EVENT_UP_DOUBLE_CLICK: Final = 11
 FLIC2_EVENT_UP_AFTER_HOLD: Final = 14
 
+# Indication opcodes (fire-and-forget, no response expected)
+OPCODE_SET_CONNECTION_PARAMETERS_IND: Final = 12
+
 # Response opcodes for button event initialization
 OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID: Final = 10
 OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID: Final = 11

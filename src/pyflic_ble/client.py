@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import contextlib
+from dataclasses import dataclass
 from enum import IntEnum
 import logging
 from typing import Any
@@ -17,6 +18,7 @@ from bleak_retry_connector import (
 )
 
 from .const import (
+    COMMAND_TIMEOUT,
     CONN_PARAM_INTERVAL_MAX,
     CONN_PARAM_INTERVAL_MIN,
     CONN_PARAM_LATENCY,
@@ -75,6 +77,16 @@ class FlicAuthenticationError(Exception):
 
 class FlicFirmwareUpdateError(Exception):
     """Flic firmware update error."""
+
+
+@dataclass
+class FlicState:
+    """State of a Flic device."""
+
+    connected: bool
+    battery_voltage: float | None
+    firmware_version: int | None
+    device_name: str | None
 
 
 class FlicClient:
@@ -156,6 +168,30 @@ class FlicClient:
 
         # Firmware update active flag (gates 0x0F notification queueing)
         self._firmware_update_active = False
+
+        # Guards against reconnect during an active start() call
+        self._starting = False
+
+        # Prevents auto-reconnect after stop()
+        self._stopped = False
+
+        # Callback registrations for multi-subscriber pattern
+        self._button_event_callbacks: list[
+            Callable[[str, dict[str, Any]], None]
+        ] = []
+        self._rotate_event_callbacks: list[
+            Callable[[str, dict[str, Any]], None]
+        ] = []
+        self._state_callbacks: list[Callable[[FlicState], None]] = []
+
+        # Connection lifecycle state
+        self._reconnect_lock = asyncio.Lock()
+        self._flic_state = FlicState(
+            connected=False,
+            battery_voltage=None,
+            firmware_version=None,
+            device_name=None,
+        )
 
     @property
     def handler(self) -> DeviceProtocolHandler:
@@ -317,8 +353,15 @@ class FlicClient:
         _LOGGER.info("BLE connection lost to %s", self.address)
         self._state = SessionState.DISCONNECTED
         self._handler.reset_state()
+        if self._flic_state.connected:
+            self._flic_state.connected = False
+            self._notify_state_callbacks()
         if self.on_disconnect:
             self.on_disconnect()
+        # Attempt reconnection unless start() is already running or stopped
+        if not self._starting and not self._stopped:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.async_reconnect())
 
     async def _request_connection_parameters(self) -> None:
         """Request BLE connection parameters for optimal communication."""
@@ -626,6 +669,22 @@ class FlicClient:
             write_packet=self._write_packet,
         )
 
+    async def _send_connection_parameters(self) -> None:
+        """Send Flic protocol connection parameters to the button.
+
+        Only supported on Flic 2 and Duo (not Twist).
+        """
+        if not self._handler.capabilities.has_frame_header:
+            return
+        await self._handler.set_connection_parameters(
+            self._connection_id,
+            self._write_packet,
+            CONN_PARAM_INTERVAL_MIN,
+            CONN_PARAM_INTERVAL_MAX,
+            CONN_PARAM_LATENCY,
+            CONN_PARAM_TIMEOUT,
+        )
+
     async def get_firmware_version(self) -> int:
         """Request the firmware version from the device."""
         if self._state != SessionState.SESSION_ESTABLISHED:
@@ -647,6 +706,22 @@ class FlicClient:
             write_packet=self._write_packet,
             wait_for_opcode=self._wait_for_handler_opcode,
         )
+
+    @staticmethod
+    def battery_raw_to_voltage(raw: int, device_type: DeviceType) -> float:
+        """Convert raw battery level to voltage.
+
+        Twist returns millivolts directly (2 AAA batteries).
+        Flic 2/Duo return a 10-bit ADC value (0-1024, 3.6V reference).
+        """
+        if device_type == DeviceType.TWIST:
+            return raw / 1000.0
+        return raw * 3.6 / 1024.0
+
+    async def get_battery_voltage(self) -> float:
+        """Request the battery level and return it as voltage."""
+        raw = await self.get_battery_level()
+        return self.battery_raw_to_voltage(raw, self._device_type)
 
     async def get_name(self) -> tuple[str, int]:
         """Request the device name."""
@@ -670,6 +745,156 @@ class FlicClient:
             write_packet=self._write_packet,
             wait_for_opcode=self._wait_for_handler_opcode,
         )
+
+    @property
+    def state(self) -> FlicState:
+        """Return current device state."""
+        return self._flic_state
+
+    def register_button_event_callback(
+        self, callback: Callable[[str, dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a button event callback. Returns an unsubscribe function."""
+        self._button_event_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._button_event_callbacks.remove(callback)
+
+        return unsubscribe
+
+    def register_rotate_event_callback(
+        self, callback: Callable[[str, dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        """Register a rotate event callback. Returns an unsubscribe function."""
+        self._rotate_event_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._rotate_event_callbacks.remove(callback)
+
+        return unsubscribe
+
+    def register_state_callback(
+        self, callback: Callable[[FlicState], None]
+    ) -> Callable[[], None]:
+        """Register a state change callback. Returns an unsubscribe function."""
+        self._state_callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._state_callbacks.remove(callback)
+
+        return unsubscribe
+
+    def _notify_state_callbacks(self) -> None:
+        """Notify all registered state callbacks."""
+        for cb in self._state_callbacks:
+            try:
+                cb(self._flic_state)
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug("Error in state callback", exc_info=True)
+
+    async def start(self) -> None:
+        """Connect, authenticate, and initialize button events.
+
+        This internalizes the full connection lifecycle:
+        connect → quick_verify → init_button_events → get_battery → get_firmware → get_name.
+        Non-fatal failures for battery/firmware/name are logged but do not prevent startup.
+        """
+        async with self._reconnect_lock:
+            self._stopped = False
+            await self._start_inner()
+
+    async def _start_inner(self) -> None:
+        """Inner start logic, must be called with _reconnect_lock held."""
+        self._starting = True
+        try:
+            await self.connect()
+            await self.quick_verify()
+            await self.init_button_events()
+            await self._send_connection_parameters()
+
+            # Request battery level (non-fatal)
+            try:
+                voltage = await self.get_battery_voltage()
+                self._flic_state.battery_voltage = voltage
+                _LOGGER.debug(
+                    "Battery voltage for %s: %.3fV", self.address, voltage
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Failed to retrieve battery level from %s", self.address
+                )
+
+            # Request firmware version (non-fatal)
+            try:
+                fw = await self.get_firmware_version()
+                self._flic_state.firmware_version = fw
+                _LOGGER.debug(
+                    "Firmware version for %s: %d", self.address, fw
+                )
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Failed to retrieve firmware version from %s", self.address
+                )
+
+            # Read device name (non-fatal)
+            try:
+                name, _ = await self.get_name()
+                self._flic_state.device_name = name if name else None
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Failed to retrieve device name from %s", self.address
+                )
+
+            self._flic_state.connected = True
+            self._notify_state_callbacks()
+            _LOGGER.info("Successfully started session with %s", self.address)
+
+        except (TimeoutError, BleakError, FlicProtocolError) as err:
+            self._flic_state.connected = False
+            _LOGGER.error("Failed to start session with %s: %s", self.address, err)
+            raise
+        finally:
+            self._starting = False
+
+    async def stop(self) -> None:
+        """Disconnect and clean up."""
+        self._stopped = True
+        self._flic_state.connected = False
+        await self.disconnect()
+
+    def set_ble_device(self, ble_device: BLEDevice) -> None:
+        """Update the BLE device reference.
+
+        If disconnected, automatically triggers a reconnection attempt.
+        """
+        self.ble_device = ble_device
+        if not self.is_connected and not self._starting and not self._stopped:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.async_reconnect())
+
+    async def async_reconnect(self) -> None:
+        """Attempt reconnection with lock to prevent concurrent attempts.
+
+        Safe to call repeatedly — the lock ensures only one attempt runs
+        at a time, and a no-op if already connected or stopped.
+        """
+        async with self._reconnect_lock:
+            if self.is_connected or self._stopped:
+                return
+            if self._flic_state.connected:
+                # Connection was lost, update state
+                self._flic_state.connected = False
+                self._notify_state_callbacks()
+            try:
+                _LOGGER.debug("Attempting to reconnect to %s", self.address)
+                await self._start_inner()
+            except Exception:  # noqa: BLE001
+                _LOGGER.debug(
+                    "Reconnection to %s failed", self.address, exc_info=True
+                )
 
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
@@ -1093,6 +1318,12 @@ class FlicClient:
                 except Exception:
                     _LOGGER.exception("Error in button event callback")
 
+            for cb in self._button_event_callbacks:
+                try:
+                    cb(event.event_type, event_data)
+                except Exception:
+                    _LOGGER.exception("Error in registered button event callback")
+
     def _emit_rotate_events(self, rotate_events: list) -> None:
         """Process and emit rotate events."""
         for event in rotate_events:
@@ -1110,6 +1341,12 @@ class FlicClient:
                 except Exception:
                     _LOGGER.exception("Error in rotate event callback")
 
+            for cb in self._rotate_event_callbacks:
+                try:
+                    cb(event.event_type, event_data)
+                except Exception:
+                    _LOGGER.exception("Error in registered rotate event callback")
+
     async def _wait_for_handler_opcode(self, opcode: int) -> bytes:
         """Wait for a response with specific opcode."""
         return await self._wait_for_handler_opcodes([opcode])
@@ -1121,8 +1358,16 @@ class FlicClient:
         min_len = 2 if has_frame_header else 1
 
         _LOGGER.debug("Waiting for opcodes %s", [hex(o) for o in opcodes])
+        deadline = asyncio.get_event_loop().time() + COMMAND_TIMEOUT
         while True:
-            response = await self._response_queue.get()
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timeout waiting for opcodes {[hex(o) for o in opcodes]}"
+                )
+            response = await asyncio.wait_for(
+                self._response_queue.get(), timeout=remaining
+            )
             if len(response) >= min_len:
                 received_opcode = response[opcode_offset]
                 if received_opcode in opcodes:

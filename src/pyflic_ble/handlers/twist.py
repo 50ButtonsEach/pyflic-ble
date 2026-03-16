@@ -8,6 +8,7 @@ import logging
 import secrets
 import struct
 import time
+from typing import Any
 
 from ..const import (
     COMMAND_TIMEOUT,
@@ -15,9 +16,13 @@ from ..const import (
     EVENT_TYPE_DOUBLE_CLICK,
     EVENT_TYPE_DOWN,
     EVENT_TYPE_HOLD,
+    EVENT_TYPE_PUSH_TWIST_DECREMENT,
+    EVENT_TYPE_PUSH_TWIST_INCREMENT,
     EVENT_TYPE_ROTATE_CLOCKWISE,
     EVENT_TYPE_ROTATE_COUNTER_CLOCKWISE,
     EVENT_TYPE_SELECTOR_CHANGED,
+    EVENT_TYPE_TWIST_DECREMENT,
+    EVENT_TYPE_TWIST_INCREMENT,
     EVENT_TYPE_UP,
     FIRMWARE_DATA_CHUNK_SIZE,
     FIRMWARE_FINAL_ACK_TIMEOUT,
@@ -26,6 +31,7 @@ from ..const import (
     FIRMWARE_UPDATE_TIMEOUT,
     PAIRING_TIMEOUT,
     TWIST_ED25519_PUBLIC_KEY,
+    TWIST_MODE_SLOT_CHANGING,
     TWIST_OPCODE_BUTTON_EVENT,
     TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
     TWIST_OPCODE_FULL_VERIFY_FAIL_RESPONSE,
@@ -114,6 +120,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._multi_mode_tracker: MultiModeRotateTracker | None = None
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
+        self._prev_int_pct: dict[int, int] = {}
 
     @property
     def service_uuid(self) -> str:
@@ -145,6 +152,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         """Return the current twist mode index."""
         return self._twist_mode_index
 
+    @property
+    def push_twist_mode(self) -> PushTwistMode:
+        """Return the push twist mode."""
+        return self._push_twist_mode
+
     def reset_state(self) -> None:
         """Reset handler state."""
         super().reset_state()
@@ -152,6 +164,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._twist_packet_counter = 0
         self._last_event_count = 0
         self._last_boot_id = 0
+        self._prev_int_pct = {}
 
     async def full_verify_pairing(
         self,
@@ -670,7 +683,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 )
 
                 # Emit selector change event for slot modes (0-11)
-                if event.twist_mode_index < 12:
+                # Suppress in DEFAULT/CONTINUOUS mode where selector is not used
+                if event.twist_mode_index < 12 and self._push_twist_mode not in (
+                    PushTwistMode.DEFAULT,
+                    PushTwistMode.CONTINUOUS,
+                ):
                     events.append(
                         ButtonEvent(
                             event_type=EVENT_TYPE_SELECTOR_CHANGED,
@@ -914,29 +931,111 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 else EVENT_TYPE_ROTATE_COUNTER_CLOCKWISE
             )
 
-            _LOGGER.debug(
-                "Emitting Twist rotate event: %s, mode=%d, detents=%d, angle=%.1f",
-                event_type,
-                notification.twist_mode_index,
-                result.detent_crossings,
-                result.angle_degrees,
+            extra_data = {
+                "selector_index": result.selector_index,
+                "total_turns": result.total_turns,
+                "total_detent_crossings": result.current_detent_crossings,
+                "acceleration_multiplier": result.acceleration_multiplier,
+                "rpm": result.rpm,
+                "twist_mode_index": notification.twist_mode_index,
+                "mode_percentage": mode_percentage,
+            }
+
+            is_default_or_continuous = self._push_twist_mode in (
+                PushTwistMode.DEFAULT,
+                PushTwistMode.CONTINUOUS,
             )
 
+            if is_default_or_continuous:
+                # Emit quantized increment/decrement events (one per 1% crossing)
+                events.extend(
+                    self._quantize_rotation(
+                        notification.twist_mode_index,
+                        mode_percentage,
+                        event_type,
+                        extra_data,
+                    )
+                )
+            else:
+                # SELECTOR mode: emit raw rotate events
+                _LOGGER.debug(
+                    "Emitting Twist rotate event: %s, mode=%d, detents=%d, angle=%.1f",
+                    event_type,
+                    notification.twist_mode_index,
+                    result.detent_crossings,
+                    result.angle_degrees,
+                )
+                events.append(
+                    RotateEvent(
+                        event_type=event_type,
+                        button_index=None,
+                        angle_degrees=result.angle_degrees,
+                        detent_crossings=abs(result.detent_crossings),
+                        extra_data=extra_data,
+                    )
+                )
+
+        return events
+
+    def _quantize_rotation(
+        self,
+        twist_mode_index: int,
+        mode_percentage: float,
+        event_type: str,
+        extra_data: dict[str, Any],
+    ) -> list[RotateEvent]:
+        """Convert a rotation event into discrete increment/decrement events.
+
+        Fires one RotateEvent per 1% boundary crossing so a jump from 1% to 4%
+        produces 3 events. Uses shorter path around wrap in CONTINUOUS mode.
+        """
+        events: list[RotateEvent] = []
+        int_pct = int(mode_percentage)
+
+        prev_pct = self._prev_int_pct.get(twist_mode_index)
+        self._prev_int_pct[twist_mode_index] = int_pct
+
+        if prev_pct is None or int_pct == prev_pct:
+            return events
+
+        is_push_twist = twist_mode_index == TWIST_MODE_SLOT_CHANGING
+        if event_type == EVENT_TYPE_ROTATE_CLOCKWISE:
+            inc_event = (
+                EVENT_TYPE_PUSH_TWIST_INCREMENT
+                if is_push_twist
+                else EVENT_TYPE_TWIST_INCREMENT
+            )
+        else:
+            inc_event = (
+                EVENT_TYPE_PUSH_TWIST_DECREMENT
+                if is_push_twist
+                else EVENT_TYPE_TWIST_DECREMENT
+            )
+
+        diff = abs(int_pct - prev_pct)
+        # In continuous mode, use the shorter path around the wrap
+        if self._push_twist_mode == PushTwistMode.CONTINUOUS and diff > 50:
+            steps = 100 - diff
+        else:
+            steps = diff
+
+        _LOGGER.debug(
+            "Quantized rotation: %s x%d (mode=%d, pct=%d->%d)",
+            inc_event,
+            steps,
+            twist_mode_index,
+            prev_pct,
+            int_pct,
+        )
+
+        for _ in range(steps):
             events.append(
                 RotateEvent(
-                    event_type=event_type,
+                    event_type=inc_event,
                     button_index=None,
-                    angle_degrees=result.angle_degrees,
-                    detent_crossings=abs(result.detent_crossings),
-                    extra_data={
-                        "selector_index": result.selector_index,
-                        "total_turns": result.total_turns,
-                        "total_detent_crossings": result.current_detent_crossings,
-                        "acceleration_multiplier": result.acceleration_multiplier,
-                        "rpm": result.rpm,
-                        "twist_mode_index": notification.twist_mode_index,
-                        "mode_percentage": mode_percentage,
-                    },
+                    angle_degrees=0.0,
+                    detent_crossings=1,
+                    extra_data=extra_data,
                 )
             )
 

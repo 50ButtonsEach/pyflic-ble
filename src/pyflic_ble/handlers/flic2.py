@@ -29,6 +29,7 @@ from ..const import (
     OPCODE_GET_BATTERY_LEVEL_REQUEST,
     OPCODE_GET_BATTERY_LEVEL_RESPONSE,
     OPCODE_GET_FIRMWARE_VERSION_REQUEST,
+    OPCODE_SET_CONNECTION_PARAMETERS_IND,
     OPCODE_GET_FIRMWARE_VERSION_RESPONSE,
     OPCODE_GET_NAME_REQUEST,
     OPCODE_GET_NAME_RESPONSE,
@@ -397,6 +398,38 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             )
         except TimeoutError:
             _LOGGER.warning("No response to InitButtonEventsRequest, continuing anyway")
+
+    async def set_connection_parameters(
+        self,
+        connection_id: int,
+        write_packet: WritePacketFn,
+        intv_min: int,
+        intv_max: int,
+        latency: int,
+        timeout: int,
+    ) -> None:
+        """Send Flic protocol connection parameters to the button.
+
+        This is a fire-and-forget indication (opcode 12) — no response expected.
+        Only supported on Flic 2 and Duo (not Twist).
+        """
+        request = struct.pack(
+            "<BBHHHH",
+            connection_id & 0x1F,
+            OPCODE_SET_CONNECTION_PARAMETERS_IND,
+            intv_min,
+            intv_max,
+            latency,
+            timeout,
+        )
+        await write_packet(request, True)
+        _LOGGER.debug(
+            "Sent SetConnectionParametersInd (intv_min=%d, intv_max=%d, latency=%d, timeout=%d)",
+            intv_min,
+            intv_max,
+            latency,
+            timeout,
+        )
 
     async def get_firmware_version(
         self,

@@ -6,6 +6,7 @@ from .client import (
     FlicFirmwareUpdateError,
     FlicPairingError,
     FlicProtocolError,
+    FlicState,
 )
 from .const import DeviceType, PushTwistMode
 from .handlers.base import DeviceCapabilities
@@ -18,5 +19,6 @@ __all__ = [
     "FlicFirmwareUpdateError",
     "FlicPairingError",
     "FlicProtocolError",
+    "FlicState",
     "PushTwistMode",
 ]

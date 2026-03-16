@@ -23,6 +23,7 @@ from ..const import (
     FLIC2_EVENT_UP_CLICK_PENDING,
     FLIC2_EVENT_UP_DOUBLE_CLICK,
     FLIC2_EVENT_UP_SINGLE_CLICK,
+    PushTwistMode,
 )
 
 if TYPE_CHECKING:
@@ -214,6 +215,11 @@ class DeviceProtocolHandler(ABC):
         wait_for_opcode: WaitForOpcodeFn,
     ) -> tuple[str, int]:
         """Set the device name."""
+
+    @property
+    def push_twist_mode(self) -> PushTwistMode | None:
+        """Return the push twist mode, or None for non-Twist devices."""
+        return None
 
     def reset_state(self) -> None:
         """Reset any handler-specific state (called on disconnect)."""
