@@ -123,9 +123,8 @@ jobs:
           echo "Bumping $current → $new_version ($bump)"
 
   publish:
-    if: github.event_name == 'workflow_dispatch'
     needs: determine-version
-    if: needs.determine-version.outputs.new_version != ''
+    if: github.event_name == 'workflow_dispatch' && needs.determine-version.outputs.new_version != ''
     runs-on: ubuntu-latest
     environment: pypi
 
