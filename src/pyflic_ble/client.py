@@ -374,6 +374,9 @@ class FlicClient:
         """Request BLE connection parameters for optimal communication."""
         if not self._client:
             return
+        if not hasattr(self._client, "set_connection_params"):
+            _LOGGER.debug("set_connection_params not available on BLE client")
+            return
         try:
             await self._client.set_connection_params(
                 CONN_PARAM_INTERVAL_MIN,
@@ -381,7 +384,7 @@ class FlicClient:
                 CONN_PARAM_LATENCY,
                 CONN_PARAM_TIMEOUT,
             )
-        except Exception as err:  # noqa: BLE001
+        except (BleakError, NotImplementedError) as err:
             _LOGGER.debug("Failed to request connection parameters: %s", err)
 
     @property

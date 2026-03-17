@@ -76,7 +76,7 @@ WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
 WriteGattFn = Callable[[str, bytes], Awaitable[None]]
 
 
-def _unbound_transport(*_args: object, **_kwargs: object) -> None:
+async def _unbound_transport(*_args: object, **_kwargs: object) -> None:
     """Sentinel that raises when transport callbacks are used before bind_transport()."""
     raise RuntimeError("Transport not bound — call bind_transport() before using handler")
 
@@ -233,6 +233,10 @@ class DeviceProtocolHandler(ABC):
     def reset_state(self) -> None:
         """Reset any handler-specific state (called on disconnect)."""
         self._rotate_tracker = None
+        self._write_gatt = _unbound_transport  # type: ignore[assignment]
+        self._write_packet = _unbound_transport  # type: ignore[assignment]
+        self._wait_for_opcode = _unbound_transport  # type: ignore[assignment]
+        self._wait_for_opcodes = _unbound_transport  # type: ignore[assignment]
 
     @staticmethod
     def _truncate_name_bytes(name: str) -> bytes:

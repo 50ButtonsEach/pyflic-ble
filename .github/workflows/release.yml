@@ -37,8 +37,23 @@ jobs:
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Determine version bump with Copilot
+      - name: Determine version bump from PR labels
+        id: labels
+        run: |
+          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$labels" | grep -q '"major"'; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | grep -q '"minor"'; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | grep -q '"patch"'; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fallback to Copilot if no label
         id: bump
+        if: steps.labels.outputs.bump == ''
         uses: github/copilot-models@v1
         with:
           model: gpt-4o
@@ -61,7 +76,8 @@ jobs:
         id: newver
         run: |
           current="${{ steps.current.outputs.version }}"
-          bump="$(echo '${{ steps.bump.outputs.bump_type }}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          bump="${{ steps.labels.outputs.bump || steps.bump.outputs.bump_type }}"
+          bump="$(echo "$bump" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 
           IFS='.' read -r major minor patch <<< "$current"
 
