@@ -83,7 +83,7 @@ jobs:
       - name: Fallback to Copilot if no label
         id: bump
         if: steps.pr.outputs.number != '' && steps.labels.outputs.bump == ''
-        uses: github/copilot-models@v1
+        uses: github/copilot-models@latest
         with:
           model: gpt-4o
           prompt: |
