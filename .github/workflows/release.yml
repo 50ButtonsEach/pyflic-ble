@@ -4,6 +4,7 @@ on:
   pull_request:
     types: [closed]
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: release
@@ -94,6 +95,7 @@ jobs:
           echo "Bumping $current → $new_version ($bump)"
 
   publish:
+    if: github.event_name == 'workflow_dispatch'
     needs: determine-version
     runs-on: ubuntu-latest
     environment: pypi
