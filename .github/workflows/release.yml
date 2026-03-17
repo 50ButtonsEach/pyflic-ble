@@ -1,0 +1,168 @@
+name: Release to PyPI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  models: read
+  pull-requests: read
+
+jobs:
+  determine-version:
+    # Only run when the push is a merged PR (has associated PR number),
+    # or always when triggered manually via workflow_dispatch
+    if: github.event_name == 'workflow_dispatch' || (github.event.head_commit.message != '' && contains(github.event.head_commit.message, '#'))
+    runs-on: ubuntu-latest
+
+    outputs:
+      current_version: ${{ steps.current.outputs.version }}
+      new_version: ${{ steps.newver.outputs.version }}
+      bump_type: ${{ steps.newver.outputs.bump }}
+      has_pr: ${{ steps.pr.outputs.number != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Find merged PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_json=$(gh pr list --state merged --base main --json number,title,body,labels --limit 1 --search "${{ github.sha }}")
+          number=$(echo "$pr_json" | python -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')")
+          if [ -z "$number" ]; then
+            echo "No merged PR found for this push, skipping release"
+            echo "number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          title=$(echo "$pr_json" | python -c "import json,sys; print(json.load(sys.stdin)[0]['title'])")
+          body=$(echo "$pr_json" | python -c "import json,sys; print(json.load(sys.stdin)[0]['body'])")
+          labels=$(echo "$pr_json" | python -c "import json,sys; print(json.dumps([l['name'] for l in json.load(sys.stdin)[0]['labels']]))")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<PREOF"
+            echo "$body"
+            echo "PREOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "labels=$labels" >> "$GITHUB_OUTPUT"
+
+      - name: Get current version
+        if: steps.pr.outputs.number != ''
+        id: current
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version bump from PR labels
+        if: steps.pr.outputs.number != ''
+        id: labels
+        run: |
+          labels='${{ steps.pr.outputs.labels }}'
+          if echo "$labels" | grep -q '"major"'; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | grep -q '"minor"'; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$labels" | grep -q '"patch"'; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fallback to Copilot if no label
+        id: bump
+        if: steps.pr.outputs.number != '' && steps.labels.outputs.bump == ''
+        uses: github/copilot-models@v1
+        with:
+          model: gpt-4o
+          prompt: |
+            You are a semantic versioning assistant. Given the PR title and body below,
+            decide whether this is a "patch", "minor", or "major" bump.
+
+            Rules:
+            - Bug fixes, refactors, docs, CI changes → patch
+            - New features, new public API → minor
+            - Breaking changes to public API → major
+
+            PR title: ${{ steps.pr.outputs.title }}
+            PR body: ${{ steps.pr.outputs.body }}
+
+            Respond with ONLY one word: patch, minor, or major
+          output-variable: bump_type
+
+      - name: Calculate new version
+        if: steps.pr.outputs.number != ''
+        id: newver
+        run: |
+          current="${{ steps.current.outputs.version }}"
+          bump="${{ steps.labels.outputs.bump || steps.bump.outputs.bump_type }}"
+          bump="$(echo "$bump" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+
+          IFS='.' read -r major minor patch <<< "$current"
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *) echo "Unknown bump type: $bump, defaulting to patch"; patch=$((patch + 1)) ;;
+          esac
+
+          new_version="${major}.${minor}.${patch}"
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current → $new_version ($bump)"
+
+  publish:
+    needs: determine-version
+    if: needs.determine-version.outputs.new_version != ''
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install build twine -e ".[dev]" || pip install build twine -e .
+
+      - name: Run tests
+        run: python -m pytest tests/
+
+      - name: Update version in pyproject.toml
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*
+
+      - name: Tag and push version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
+          git tag "v${{ needs.determine-version.outputs.new_version }}"
+          git push origin main --tags

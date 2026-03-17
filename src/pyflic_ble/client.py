@@ -10,11 +10,12 @@ from enum import IntEnum
 import logging
 from typing import Any
 
-from bleak import BleakClient, BleakError
+from bleak import BleakError
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import (
     close_stale_connections_by_address,
     establish_connection,
+    BleakClientWithServiceCache,
 )
 
 from .const import (
@@ -115,7 +116,7 @@ class FlicClient:
         """Initialize Flic client."""
         self.ble_device = ble_device
         self.address = address
-        self._client: BleakClient | None = None
+        self._client: BleakClientWithServiceCache | None = None
         self._state = SessionState.DISCONNECTED
         self._connection_id = 0
 
@@ -176,16 +177,14 @@ class FlicClient:
         self._stopped = False
 
         # Callback registrations for multi-subscriber pattern
-        self._button_event_callbacks: list[
-            Callable[[str, dict[str, Any]], None]
-        ] = []
-        self._rotate_event_callbacks: list[
-            Callable[[str, dict[str, Any]], None]
-        ] = []
+        self._button_event_callbacks: list[Callable[[str, dict[str, Any]], None]] = []
+        self._rotate_event_callbacks: list[Callable[[str, dict[str, Any]], None]] = []
         self._state_callbacks: list[Callable[[FlicState], None]] = []
 
         # Connection lifecycle state
         self._reconnect_lock = asyncio.Lock()
+        self._reconnect_event = asyncio.Event()
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -234,8 +233,12 @@ class FlicClient:
         # (e.g. after firmware update reboot or unexpected disconnect)
         if self._client:
             _LOGGER.debug("Cleaning up stale connection to %s", self.address)
+            # Mark intentional to prevent _handle_disconnected from firing
+            # during stale cleanup (it would re-enter reconnect logic).
+            self._intentional_disconnect = True
             with contextlib.suppress(BleakError):
                 await self._client.disconnect()
+            self._intentional_disconnect = False
 
             # Re-check after await: a firmware update may have started on
             # another FlicClient for this address during the disconnect.
@@ -267,7 +270,7 @@ class FlicClient:
             _LOGGER.info("Connecting to Flic button at %s", self.address)
             await close_stale_connections_by_address(self.address)
             self._client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 self.ble_device,
                 self.address,
                 disconnected_callback=self._handle_disconnected,
@@ -319,8 +322,18 @@ class FlicClient:
             _LOGGER.debug("Notifications started successfully for %s", self.address)
 
             self._state = SessionState.CONNECTED
+            self._connection_id = 0
+            self._handler.connection_id = 0
             self._packet_counter_to_button = 0
             self._packet_counter_from_button = 0
+
+            # Bind transport callbacks so handler methods can use self._write_packet etc.
+            self._handler.bind_transport(
+                write_gatt=self._write_gatt,
+                write_packet=self._write_packet,
+                wait_for_opcode=self._wait_for_handler_opcode,
+                wait_for_opcodes=self._wait_for_handler_opcodes,
+            )
             _LOGGER.debug("Session state set to CONNECTED")
 
             # Small delay to let notifications stabilize
@@ -345,7 +358,7 @@ class FlicClient:
                 self._state = SessionState.DISCONNECTED
                 self._handler.reset_state()
 
-    def _handle_disconnected(self, _client: BleakClient) -> None:
+    def _handle_disconnected(self, _client: BleakClientWithServiceCache) -> None:
         """Handle BLE disconnection event from Bleak."""
         if self._intentional_disconnect:
             self._intentional_disconnect = False
@@ -360,196 +373,24 @@ class FlicClient:
             self.on_disconnect()
         # Attempt reconnection unless start() is already running or stopped
         if not self._starting and not self._stopped:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.async_reconnect())
+            self._schedule_reconnect()
 
     async def _request_connection_parameters(self) -> None:
         """Request BLE connection parameters for optimal communication."""
         if not self._client:
             return
-
+        if not hasattr(self._client, "set_connection_params"):
+            _LOGGER.debug("set_connection_params not available on BLE client")
+            return
         try:
-            # Try to access the backend's connection parameter method
-            # This is available on some Bleak backends
-            backend = getattr(self._client, "_backend", None)
-            if backend is None:
-                _LOGGER.debug("No backend available for connection parameters")
-                return
-
-            backend_class_name = type(backend).__name__
-
-            # Check for BlueZ DBus backend (Linux)
-            if hasattr(backend, "_device_path"):
-                await self._request_connection_parameters_bluez(backend)
-            # Check for Core Bluetooth backend (macOS)
-            elif backend_class_name == "BleakClientCoreBluetooth" or hasattr(
-                backend, "_peripheral"
-            ):
-                await self._request_connection_parameters_corebluetooth(backend)
-            # Check for WinRT backend (Windows)
-            elif backend_class_name == "BleakClientWinRT" or hasattr(
-                backend, "_requester"
-            ):
-                await self._request_connection_parameters_winrt(backend)
-            else:
-                _LOGGER.debug(
-                    "Connection parameter request not supported for backend: %s",
-                    backend_class_name,
-                )
-        except Exception as err:  # noqa: BLE001
-            # Connection parameter request is optional, don't fail the connection
+            await self._client.set_connection_params(
+                CONN_PARAM_INTERVAL_MIN,
+                CONN_PARAM_INTERVAL_MAX,
+                CONN_PARAM_LATENCY,
+                CONN_PARAM_TIMEOUT,
+            )
+        except (BleakError, NotImplementedError) as err:
             _LOGGER.debug("Failed to request connection parameters: %s", err)
-
-    async def _request_connection_parameters_bluez(self, backend: object) -> None:
-        """Request connection parameters on BlueZ (Linux)."""
-        bus = None
-        try:
-            from dbus_fast.aio import MessageBus  # noqa: PLC0415
-
-            bus = await MessageBus().connect()
-
-            # Get the device path from the backend
-            device_path = getattr(backend, "_device_path", None)
-            if not device_path:
-                _LOGGER.debug("No device path available for connection parameters")
-                return
-
-            # BlueZ Device1 interface for connection parameters
-            introspection = await bus.introspect("org.bluez", device_path)
-            proxy = bus.get_proxy_object("org.bluez", device_path, introspection)
-
-            # Check if the device interface supports connection parameters
-            try:
-                proxy.get_interface("org.bluez.Device1")
-            except Exception:  # noqa: BLE001
-                _LOGGER.debug("Device1 interface not available")
-                return
-
-            # Request connection parameters via org.freedesktop.DBus.Properties
-            # Note: Not all BlueZ versions support setting connection parameters
-            # The parameters are: MinInterval, MaxInterval, Latency, Timeout
-            _LOGGER.debug(
-                "Requesting connection parameters: latency=%d, "
-                "interval=[%d, %d], timeout=%d",
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_TIMEOUT,
-            )
-
-            # BlueZ may not expose direct connection parameter setting
-            # but logging the intent for debugging purposes
-            _LOGGER.info(
-                "BLE connection established with requested parameters: "
-                "latency=%d, interval_min=%d, interval_max=%d, timeout=%d",
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_TIMEOUT,
-            )
-
-        except ImportError:
-            _LOGGER.debug("dbus_fast not available for connection parameter request")
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("BlueZ connection parameter request failed: %s", err)
-        finally:
-            if bus is not None:
-                bus.disconnect()
-
-    async def _request_connection_parameters_corebluetooth(
-        self, backend: object
-    ) -> None:
-        """Request connection parameters on Core Bluetooth (macOS)."""
-        try:
-            # Core Bluetooth doesn't expose connection parameter APIs to centrals
-            # The CBPeripheral can request updates via L2CAP, but CBCentralManager
-            # doesn't provide methods to set preferred connection parameters
-            _LOGGER.debug(
-                "Core Bluetooth (macOS): connection parameters are managed by the "
-                "system. Desired parameters: latency=%d, interval=[%d, %d], "
-                "timeout=%d",
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_TIMEOUT,
-            )
-
-            # Check if we can access the peripheral for logging purposes
-            peripheral = getattr(backend, "_peripheral", None)
-            if peripheral:
-                _LOGGER.info(
-                    "BLE connection established (macOS Core Bluetooth). "
-                    "Connection parameters are system-managed"
-                )
-            else:
-                _LOGGER.debug("Core Bluetooth peripheral not accessible")
-
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Core Bluetooth connection parameter request failed: %s", err)
-
-    async def _request_connection_parameters_winrt(self, backend: object) -> None:
-        """Request connection parameters on Windows (WinRT)."""
-        try:
-            # Try to import Windows-specific modules
-            from winrt.windows.devices.bluetooth import (  # noqa: PLC0415
-                BluetoothLEPreferredConnectionParametersRequest,
-            )
-
-            # Get the BluetoothLEDevice from the backend
-            requester = getattr(backend, "_requester", None)
-            if not requester:
-                _LOGGER.debug("WinRT requester not available")
-                return
-
-            # Try to request preferred connection parameters
-            # Note: WinRT uses different units than BLE spec
-            # Interval is in units of 1.25ms, timeout in units of 10ms
-            request = BluetoothLEPreferredConnectionParametersRequest.create_from_connection_parameters(
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_TIMEOUT,
-            )
-
-            if request:
-                result = await requester.request_preferred_connection_parameters_async(
-                    request
-                )
-                _LOGGER.info(
-                    "WinRT connection parameters requested: latency=%d, "
-                    "interval=[%d, %d], timeout=%d, result=%s",
-                    CONN_PARAM_LATENCY,
-                    CONN_PARAM_INTERVAL_MIN,
-                    CONN_PARAM_INTERVAL_MAX,
-                    CONN_PARAM_TIMEOUT,
-                    result,
-                )
-            else:
-                _LOGGER.debug("Failed to create WinRT connection parameter request")
-
-        except ImportError:
-            # WinRT modules not available (not on Windows)
-            _LOGGER.debug(
-                "WinRT modules not available. Desired connection parameters: "
-                "latency=%d, interval=[%d, %d], timeout=%d",
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_TIMEOUT,
-            )
-        except AttributeError as err:
-            # API might not be available in all Windows versions
-            _LOGGER.debug(
-                "WinRT connection parameter API not available: %s. "
-                "Desired parameters: latency=%d, interval=[%d, %d], timeout=%d",
-                err,
-                CONN_PARAM_LATENCY,
-                CONN_PARAM_INTERVAL_MIN,
-                CONN_PARAM_INTERVAL_MAX,
-                CONN_PARAM_TIMEOUT,
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("WinRT connection parameter request failed: %s", err)
 
     @property
     def is_connected(self) -> bool:
@@ -589,13 +430,10 @@ class FlicClient:
                 sig_bits,
                 button_uuid,
                 firmware_version,
-            ) = await self._handler.full_verify_pairing(
-                write_gatt=self._write_gatt,
-                wait_for_opcode=self._wait_for_handler_opcode,
-                wait_for_opcodes=self._wait_for_handler_opcodes,
-                write_packet=self._write_packet,
-            )
+            ) = await self._handler.full_verify_pairing()
 
+            # Handler resets its connection_id to 0 after pairing; sync client
+            self._connection_id = 0
             self._pairing_id = pairing_id
             self._pairing_key = pairing_key
             self._sig_bits = sig_bits
@@ -629,9 +467,6 @@ class FlicClient:
             session_key, chaskey_keys = await self._handler.quick_verify(
                 pairing_id=self._pairing_id,
                 pairing_key=self._pairing_key,
-                write_gatt=self._write_gatt,
-                wait_for_opcode=self._wait_for_handler_opcode,
-                write_packet=self._write_packet,
                 sig_bits=self._sig_bits,
             )
 
@@ -659,26 +494,15 @@ class FlicClient:
             self._serial_number,
         )
 
+        self._handler.connection_id = self._connection_id
         await self._handler.init_button_events(
-            connection_id=self._connection_id,
             session_key=self._session_key,
             chaskey_keys=self._chaskey_keys,
-            write_gatt=self._write_gatt,
-            wait_for_opcode=self._wait_for_handler_opcode,
-            wait_for_opcodes=self._wait_for_handler_opcodes,
-            write_packet=self._write_packet,
         )
 
     async def _send_connection_parameters(self) -> None:
-        """Send Flic protocol connection parameters to the button.
-
-        Only supported on Flic 2 and Duo (not Twist).
-        """
-        if not self._handler.capabilities.has_frame_header:
-            return
+        """Send Flic protocol connection parameters to the button."""
         await self._handler.set_connection_parameters(
-            self._connection_id,
-            self._write_packet,
             CONN_PARAM_INTERVAL_MIN,
             CONN_PARAM_INTERVAL_MAX,
             CONN_PARAM_LATENCY,
@@ -690,22 +514,14 @@ class FlicClient:
         if self._state != SessionState.SESSION_ESTABLISHED:
             raise FlicProtocolError("Session not established")
 
-        return await self._handler.get_firmware_version(
-            connection_id=self._connection_id,
-            write_packet=self._write_packet,
-            wait_for_opcode=self._wait_for_handler_opcode,
-        )
+        return await self._handler.get_firmware_version()
 
     async def get_battery_level(self) -> int:
         """Request the battery level from the device."""
         if self._state != SessionState.SESSION_ESTABLISHED:
             raise FlicProtocolError("Session not established")
 
-        return await self._handler.get_battery_level(
-            connection_id=self._connection_id,
-            write_packet=self._write_packet,
-            wait_for_opcode=self._wait_for_handler_opcode,
-        )
+        return await self._handler.get_battery_level()
 
     @staticmethod
     def battery_raw_to_voltage(raw: int, device_type: DeviceType) -> float:
@@ -728,23 +544,14 @@ class FlicClient:
         if self._state != SessionState.SESSION_ESTABLISHED:
             raise FlicProtocolError("Session not established")
 
-        return await self._handler.get_name(
-            connection_id=self._connection_id,
-            write_packet=self._write_packet,
-            wait_for_opcode=self._wait_for_handler_opcode,
-        )
+        return await self._handler.get_name()
 
     async def set_name(self, name: str) -> tuple[str, int]:
         """Set the device name."""
         if self._state != SessionState.SESSION_ESTABLISHED:
             raise FlicProtocolError("Session not established")
 
-        return await self._handler.set_name(
-            connection_id=self._connection_id,
-            name=name,
-            write_packet=self._write_packet,
-            wait_for_opcode=self._wait_for_handler_opcode,
-        )
+        return await self._handler.set_name(name=name)
 
     @property
     def state(self) -> FlicState:
@@ -819,9 +626,7 @@ class FlicClient:
             try:
                 voltage = await self.get_battery_voltage()
                 self._flic_state.battery_voltage = voltage
-                _LOGGER.debug(
-                    "Battery voltage for %s: %.3fV", self.address, voltage
-                )
+                _LOGGER.debug("Battery voltage for %s: %.3fV", self.address, voltage)
             except Exception:  # noqa: BLE001
                 _LOGGER.warning(
                     "Failed to retrieve battery level from %s", self.address
@@ -831,9 +636,7 @@ class FlicClient:
             try:
                 fw = await self.get_firmware_version()
                 self._flic_state.firmware_version = fw
-                _LOGGER.debug(
-                    "Firmware version for %s: %d", self.address, fw
-                )
+                _LOGGER.debug("Firmware version for %s: %d", self.address, fw)
             except Exception:  # noqa: BLE001
                 _LOGGER.warning(
                     "Failed to retrieve firmware version from %s", self.address
@@ -844,9 +647,7 @@ class FlicClient:
                 name, _ = await self.get_name()
                 self._flic_state.device_name = name if name else None
             except Exception:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Failed to retrieve device name from %s", self.address
-                )
+                _LOGGER.debug("Failed to retrieve device name from %s", self.address)
 
             self._flic_state.connected = True
             self._notify_state_callbacks()
@@ -863,38 +664,93 @@ class FlicClient:
         """Disconnect and clean up."""
         self._stopped = True
         self._flic_state.connected = False
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         await self.disconnect()
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Update the BLE device reference.
 
         If disconnected, automatically triggers a reconnection attempt.
+        Wakes any sleeping reconnect loop to retry immediately.
         """
         self.ble_device = ble_device
+        self._reconnect_event.set()
         if not self.is_connected and not self._starting and not self._stopped:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.async_reconnect())
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnect task if one is not already running."""
+        if self._reconnect_task and not self._reconnect_task.done():
+            _LOGGER.debug(
+                "Reconnect task already running for %s, skipping", self.address
+            )
+            return
+        loop = asyncio.get_running_loop()
+        self._reconnect_task = loop.create_task(
+            self._async_reconnect_loop(),
+            name=f"flic-reconnect-{self.address}",
+        )
+
+    async def _async_reconnect_loop(self) -> None:
+        """Reconnect loop wrapper that catches all exceptions."""
+        try:
+            await self.async_reconnect()
+        except asyncio.CancelledError:
+            _LOGGER.info(
+                "Reconnect task for %s was cancelled", self.address
+            )
+        except BaseException:
+            _LOGGER.exception(
+                "Unexpected error in reconnect loop for %s", self.address
+            )
 
     async def async_reconnect(self) -> None:
-        """Attempt reconnection with lock to prevent concurrent attempts.
+        """Attempt reconnection with exponential backoff.
 
         Safe to call repeatedly — the lock ensures only one attempt runs
-        at a time, and a no-op if already connected or stopped.
+        at a time. set_ble_device() wakes the backoff sleep to retry
+        immediately with the fresh BLEDevice.
         """
-        async with self._reconnect_lock:
-            if self.is_connected or self._stopped:
-                return
-            if self._flic_state.connected:
-                # Connection was lost, update state
-                self._flic_state.connected = False
-                self._notify_state_callbacks()
+        delay = 5
+        max_delay = 300
+        _LOGGER.debug(
+            "Starting reconnect loop for %s", self.address
+        )
+        while not self.is_connected and not self._stopped:
+            async with self._reconnect_lock:
+                if self.is_connected or self._stopped:
+                    return
+                if self._flic_state.connected:
+                    self._flic_state.connected = False
+                    self._notify_state_callbacks()
+                try:
+                    _LOGGER.debug(
+                        "Attempting to reconnect to %s", self.address
+                    )
+                    await self._start_inner()
+                    return
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "Reconnection to %s failed, retrying in %ds",
+                        self.address,
+                        delay,
+                        exc_info=True,
+                    )
+
+            # Sleep outside the lock; woken early by set_ble_device()
+            # Clear AFTER wait so a signal set during _start_inner() is not lost.
             try:
-                _LOGGER.debug("Attempting to reconnect to %s", self.address)
-                await self._start_inner()
-            except Exception:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Reconnection to %s failed", self.address, exc_info=True
+                await asyncio.wait_for(
+                    self._reconnect_event.wait(), timeout=delay
                 )
+                # Woken by new advertisement — reset backoff
+                delay = 5
+            except TimeoutError:
+                delay = min(delay * 2, max_delay)
+            finally:
+                self._reconnect_event.clear()
 
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
@@ -938,8 +794,6 @@ class FlicClient:
             try:
                 start_pos = await self._handler.start_firmware_update(
                     firmware_binary=firmware_binary,
-                    write_packet=self._write_packet,
-                    wait_for_opcodes=self._wait_for_handler_opcodes,
                 )
             except ValueError as err:
                 raise FlicFirmwareUpdateError(str(err)) from err
@@ -947,8 +801,6 @@ class FlicClient:
             success = await self._handler.send_firmware_data(
                 firmware_binary=firmware_binary,
                 start_pos=start_pos,
-                write_packet=self._write_packet,
-                wait_for_opcode=self._wait_for_handler_opcode,
                 progress_callback=progress_callback,
             )
 
@@ -957,10 +809,7 @@ class FlicClient:
                     "Firmware signature verification failed on device"
                 )
 
-            await self._handler.send_force_disconnect(
-                write_packet=self._write_packet,
-                restart_adv=True,
-            )
+            await self._handler.send_force_disconnect(restart_adv=True)
 
             return True
         finally:
@@ -1130,6 +979,7 @@ class FlicClient:
 
         if newly_assigned:
             self._connection_id = conn_id
+            self._handler.connection_id = conn_id
             _LOGGER.debug("Connection ID assigned by button: %d", conn_id)
 
         # Handle fragmented packets
@@ -1200,7 +1050,7 @@ class FlicClient:
 
         # Delegate to handler for event processing
         button_events, rotate_events, _selector_index = (
-            self._handler.handle_notification(bytes(data), self._connection_id)
+            self._handler.handle_notification(bytes(data))
         )
 
         # Emit events
@@ -1265,7 +1115,7 @@ class FlicClient:
 
         # Delegate to handler
         button_events, rotate_events, selector_index = (
-            self._handler.handle_notification(bytes(data), self._connection_id)
+            self._handler.handle_notification(bytes(data))
         )
 
         # Emit events

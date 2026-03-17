@@ -68,10 +68,6 @@ from .base import (
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
-    WaitForOpcodeFn,
-    WaitForOpcodesFn,
-    WriteGattFn,
-    WritePacketFn,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,7 +87,6 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
     def __init__(self) -> None:
         """Initialize the Flic 2 handler."""
         super().__init__()
-        self._connection_id = 0
 
     @property
     def service_uuid(self) -> str:
@@ -118,22 +113,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         """Return the device capabilities."""
         return self._CAPABILITIES
 
-    @property
-    def connection_id(self) -> int:
-        """Return the current connection ID."""
-        return self._connection_id
-
-    @connection_id.setter
-    def connection_id(self, value: int) -> None:
-        """Set the connection ID."""
-        self._connection_id = value
-
     async def full_verify_pairing(
         self,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> tuple[int, bytes, str, int, int, bytes, int]:
         """Perform full pairing verification for Flic 2."""
         # Generate temporary connection ID for pairing
@@ -159,12 +140,12 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             len(request1),
         )
 
-        await write_packet(request1, False)
+        await self._write_packet(request1, False)
         _LOGGER.debug("FullVerifyRequest1 sent, waiting for FullVerifyResponse1")
 
         # Wait for FullVerifyResponse1
         response1 = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_1),
+            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_1),
             timeout=PAIRING_TIMEOUT,
         )
         _LOGGER.debug("Received FullVerifyResponse1 (length=%d bytes)", len(response1))
@@ -253,12 +234,12 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             len(request2),
         )
 
-        await write_packet(request2, False)
+        await self._write_packet(request2, False)
         _LOGGER.debug("FullVerifyRequest2 sent, waiting for FullVerifyResponse2")
 
         # Wait for FullVerifyResponse2
         response2_data = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_2),
+            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_2),
             timeout=PAIRING_TIMEOUT,
         )
         _LOGGER.debug(
@@ -296,9 +277,6 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         self,
         pairing_id: int,
         pairing_key: bytes,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        write_packet: WritePacketFn,
         sig_bits: int = 0,
     ) -> tuple[bytes, list[int]]:
         """Perform quick verification for Flic 2."""
@@ -323,11 +301,11 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             pairing_id,
         )
 
-        await write_packet(request, False)
+        await self._write_packet(request, False)
         _LOGGER.debug("QuickVerifyRequest sent, waiting for QuickVerifyResponse")
 
         response_data = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_QUICK_VERIFY_RESPONSE),
+            self._wait_for_opcode(OPCODE_QUICK_VERIFY_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         _LOGGER.debug(
@@ -352,17 +330,10 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
     async def init_button_events(
         self,
-        connection_id: int,
         session_key: bytes | None,
         chaskey_keys: list[int] | None,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> None:
         """Initialize button events for Flic 2."""
-        self._connection_id = connection_id
-
         request_msg = InitButtonEventsRequest(
             connection_id=self._connection_id,
             event_count=0,
@@ -379,11 +350,11 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             len(request),
         )
 
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         try:
             response = await asyncio.wait_for(
-                wait_for_opcodes(
+                self._wait_for_opcodes(
                     [
                         OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
                         OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID,
@@ -401,8 +372,6 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
     async def set_connection_parameters(
         self,
-        connection_id: int,
-        write_packet: WritePacketFn,
         intv_min: int,
         intv_max: int,
         latency: int,
@@ -415,14 +384,14 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         """
         request = struct.pack(
             "<BBHHHH",
-            connection_id & 0x1F,
+            self._connection_id & 0x1F,
             OPCODE_SET_CONNECTION_PARAMETERS_IND,
             intv_min,
             intv_max,
             latency,
             timeout,
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
         _LOGGER.debug(
             "Sent SetConnectionParametersInd (intv_min=%d, intv_max=%d, latency=%d, timeout=%d)",
             intv_min,
@@ -431,55 +400,40 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             timeout,
         )
 
-    async def get_firmware_version(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_firmware_version(self) -> int:
         """Request and return the firmware version from a Flic 2/Duo device."""
         request = struct.pack(
-            "<BB", connection_id & 0x1F, OPCODE_GET_FIRMWARE_VERSION_REQUEST
+            "<BB", self._connection_id & 0x1F, OPCODE_GET_FIRMWARE_VERSION_REQUEST
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_GET_FIRMWARE_VERSION_RESPONSE),
+            self._wait_for_opcode(OPCODE_GET_FIRMWARE_VERSION_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         return int(struct.unpack("<I", response[2:6])[0])
 
-    async def get_battery_level(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_battery_level(self) -> int:
         """Request and return the battery level from a Flic 2/Duo device."""
         request = struct.pack(
-            "<BB", connection_id & 0x1F, OPCODE_GET_BATTERY_LEVEL_REQUEST
+            "<BB", self._connection_id & 0x1F, OPCODE_GET_BATTERY_LEVEL_REQUEST
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_GET_BATTERY_LEVEL_RESPONSE),
+            self._wait_for_opcode(OPCODE_GET_BATTERY_LEVEL_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [header:1][opcode:1][battery_level:2]
         return int(struct.unpack("<H", response[2:4])[0])
 
-    async def get_name(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> tuple[str, int]:
+    async def get_name(self) -> tuple[str, int]:
         """Request and return the device name from a Flic 2/Duo device."""
-        request = struct.pack("<BB", connection_id & 0x1F, OPCODE_GET_NAME_REQUEST)
-        await write_packet(request, True)
+        request = struct.pack("<BB", self._connection_id & 0x1F, OPCODE_GET_NAME_REQUEST)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_GET_NAME_RESPONSE),
+            self._wait_for_opcode(OPCODE_GET_NAME_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [header:1][opcode:1][timestamp:6][name:var]
@@ -489,10 +443,7 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
     async def set_name(
         self,
-        connection_id: int,
         name: str,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
     ) -> tuple[str, int]:
         """Set the device name on a Flic 2/Duo device."""
         name_bytes = self._truncate_name_bytes(name)
@@ -504,14 +455,14 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         timestamp_force_bytes = timestamp_force.to_bytes(6, "little")
 
         request = (
-            struct.pack("<BB", connection_id & 0x1F, OPCODE_SET_NAME_REQUEST)
+            struct.pack("<BB", self._connection_id & 0x1F, OPCODE_SET_NAME_REQUEST)
             + timestamp_force_bytes
             + name_bytes
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(OPCODE_SET_NAME_RESPONSE),
+            self._wait_for_opcode(OPCODE_SET_NAME_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [header:1][opcode:1][timestamp:6][name:var]
@@ -528,16 +479,14 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
     async def start_firmware_update(
         self,
         firmware_binary: bytes,
-        write_packet: WritePacketFn,
-        wait_for_opcodes: WaitForOpcodesFn,
     ) -> int:
         """Start a firmware update on a Flic 2/Duo device."""
-        await write_packet(self._build_firmware_start_packet(firmware_binary), True)
+        await self._write_packet(self._build_firmware_start_packet(firmware_binary), True)
 
         # Wait for either StartFirmwareUpdateResponse (18) or
         # FirmwareUpdateNotification (19).
         response_data = await asyncio.wait_for(
-            wait_for_opcodes(
+            self._wait_for_opcodes(
                 [
                     OPCODE_START_FIRMWARE_UPDATE_RESPONSE,
                     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
@@ -567,8 +516,6 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         self,
         firmware_binary: bytes,
         start_pos: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
         """Send firmware data to a Flic 2 device with word-based flow control."""
@@ -590,7 +537,7 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             # Flow control: wait if too many words in flight
             while sent_words - acked_words >= FLIC2_FIRMWARE_MAX_IN_FLIGHT_WORDS:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_UPDATE_TIMEOUT,
                 )
                 # Strip frame header for parsing
@@ -633,7 +580,7 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             data_ind = Flic2FirmwareUpdateDataInd(
                 connection_id=self._connection_id, words=words
             )
-            await write_packet(data_ind.to_bytes(), True)
+            await self._write_packet(data_ind.to_bytes(), True)
             sent_words += chunk_word_count
 
         # Wait for remaining acknowledgments.
@@ -643,7 +590,7 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         try:
             while acked_words < total_words:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_FINAL_ACK_TIMEOUT,
                 )
                 notification = FirmwareUpdateNotification.from_bytes(
@@ -669,20 +616,18 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
     async def send_force_disconnect(
         self,
-        write_packet: WritePacketFn,
         restart_adv: bool = True,
     ) -> None:
         """Send force disconnect to trigger device reboot."""
         ind = Flic2ForceBtDisconnectInd(
             connection_id=self._connection_id, restart_adv=restart_adv
         )
-        await write_packet(ind.to_bytes(), True)
+        await self._write_packet(ind.to_bytes(), True)
         _LOGGER.debug("Sent Flic2ForceBtDisconnectInd (restart_adv=%s)", restart_adv)
 
     def handle_notification(
         self,
         data: bytes,
-        connection_id: int,
     ) -> tuple[list[ButtonEvent], list[RotateEvent], int | None]:
         """Handle a notification from a Flic 2 button."""
         button_events: list[ButtonEvent] = []

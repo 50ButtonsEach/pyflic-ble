@@ -86,10 +86,6 @@ from .base import (
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
-    WaitForOpcodeFn,
-    WaitForOpcodesFn,
-    WriteGattFn,
-    WritePacketFn,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -168,10 +164,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
     async def full_verify_pairing(
         self,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> tuple[int, bytes, str, int, int, bytes, int]:
         """Perform full pairing verification for Flic Twist."""
         temp_conn_id = secrets.randbelow(2**32)
@@ -187,11 +179,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             "Sending TwistFullVerifyRequest1 (length=%d bytes)", len(request1)
         )
 
-        await write_gatt(self.write_char_uuid, request1)
+        await self._write_gatt(self.write_char_uuid, request1)
         _LOGGER.debug("TwistFullVerifyRequest1 sent, waiting for response")
 
         response1 = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_FULL_VERIFY_RESPONSE_1),
+            self._wait_for_opcode(TWIST_OPCODE_FULL_VERIFY_RESPONSE_1),
             timeout=PAIRING_TIMEOUT,
         )
         _LOGGER.debug(
@@ -277,11 +269,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             "Sending TwistFullVerifyRequest2 (%d bytes)",
             len(request2),
         )
-        await write_gatt(self.write_char_uuid, request2)
+        await self._write_gatt(self.write_char_uuid, request2)
 
         # Wait for response
         response2_data = await asyncio.wait_for(
-            wait_for_opcodes(
+            self._wait_for_opcodes(
                 [
                     TWIST_OPCODE_FULL_VERIFY_RESPONSE_2,
                     TWIST_OPCODE_FULL_VERIFY_FAIL_RESPONSE,
@@ -320,9 +312,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self,
         pairing_id: int,
         pairing_key: bytes,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        write_packet: WritePacketFn,
         sig_bits: int = 0,
     ) -> tuple[bytes, list[int]]:
         """Perform quick verification for Flic Twist."""
@@ -347,11 +336,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             len(request),
         )
 
-        await write_gatt(self.write_char_uuid, request)
+        await self._write_gatt(self.write_char_uuid, request)
         _LOGGER.debug("TwistQuickVerifyRequest sent, waiting for response")
 
         response_data = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_QUICK_VERIFY_RESPONSE),
+            self._wait_for_opcode(TWIST_OPCODE_QUICK_VERIFY_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         _LOGGER.debug(
@@ -379,13 +368,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
     async def init_button_events(
         self,
-        connection_id: int,
         session_key: bytes | None,
         chaskey_keys: list[int] | None,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> None:
         """Initialize button events for Flic Twist."""
         self._multi_mode_tracker = MultiModeRotateTracker(
@@ -460,11 +444,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         )
 
         authenticated = session_key is not None and chaskey_keys is not None
-        await write_packet(request, authenticated)
+        await self._write_packet(request, authenticated)
 
         try:
             response = await asyncio.wait_for(
-                wait_for_opcode(TWIST_OPCODE_INIT_BUTTON_EVENTS_RESPONSE),
+                self._wait_for_opcode(TWIST_OPCODE_INIT_BUTTON_EVENTS_RESPONSE),
                 timeout=COMMAND_TIMEOUT,
             )
 
@@ -491,51 +475,36 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 "No response to InitButtonEventsTwistRequest, continuing anyway"
             )
 
-    async def get_firmware_version(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_firmware_version(self) -> int:
         """Request and return the firmware version from a Flic Twist device."""
         request = struct.pack("<B", TWIST_OPCODE_GET_FIRMWARE_VERSION_REQUEST)
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_GET_FIRMWARE_VERSION_RESPONSE),
+            self._wait_for_opcode(TWIST_OPCODE_GET_FIRMWARE_VERSION_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         return int(struct.unpack("<I", response[1:5])[0])
 
-    async def get_battery_level(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_battery_level(self) -> int:
         """Request and return the battery level from a Flic Twist device."""
         request = struct.pack("<B", TWIST_OPCODE_GET_BATTERY_LEVEL_REQUEST)
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_GET_BATTERY_LEVEL_RESPONSE),
+            self._wait_for_opcode(TWIST_OPCODE_GET_BATTERY_LEVEL_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [opcode:1][battery_level:2]
         return int(struct.unpack("<H", response[1:3])[0])
 
-    async def get_name(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> tuple[str, int]:
+    async def get_name(self) -> tuple[str, int]:
         """Request and return the device name from a Flic Twist device."""
         request = struct.pack("<B", TWIST_OPCODE_GET_NAME_REQUEST)
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_GET_NAME_RESPONSE),
+            self._wait_for_opcode(TWIST_OPCODE_GET_NAME_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [opcode:1][timestamp:6][name:var]
@@ -545,10 +514,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
     async def set_name(
         self,
-        connection_id: int,
         name: str,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
     ) -> tuple[str, int]:
         """Set the device name on a Flic Twist device."""
         name_bytes = self._truncate_name_bytes(name)
@@ -563,10 +529,10 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             + timestamp_force_bytes
             + name_bytes
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         response = await asyncio.wait_for(
-            wait_for_opcode(TWIST_OPCODE_SET_NAME_RESPONSE),
+            self._wait_for_opcode(TWIST_OPCODE_SET_NAME_RESPONSE),
             timeout=COMMAND_TIMEOUT,
         )
         # Response: [opcode:1][timestamp:6][name:var]
@@ -577,7 +543,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
     def handle_notification(
         self,
         data: bytes,
-        connection_id: int,
     ) -> tuple[list[ButtonEvent], list[RotateEvent], int | None]:
         """Handle a notification from a Flic Twist button."""
         button_events: list[ButtonEvent] = []
@@ -744,18 +709,16 @@ class TwistProtocolHandler(DeviceProtocolHandler):
     async def start_firmware_update(
         self,
         firmware_binary: bytes,
-        write_packet: WritePacketFn,
-        wait_for_opcodes: WaitForOpcodesFn,
     ) -> int:
         """Start a firmware update on the device."""
         request = StartFirmwareUpdateRequest.from_firmware_binary(firmware_binary)
-        await write_packet(request.to_bytes(), True)
+        await self._write_packet(request.to_bytes(), True)
 
         # Wait for either StartFirmwareUpdateResponse (0x0E) or
         # FirmwareUpdateNotification (0x0F). The device may send 0x0F
         # immediately if resuming a previous transfer.
         response_data = await asyncio.wait_for(
-            wait_for_opcodes(
+            self._wait_for_opcodes(
                 [
                     TWIST_OPCODE_START_FIRMWARE_UPDATE_RESPONSE,
                     TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
@@ -784,8 +747,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self,
         firmware_binary: bytes,
         start_pos: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
         """Send firmware data chunks to the device with flow control."""
@@ -804,7 +765,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             # Flow control: wait if too many bytes in flight
             while sent_pos - acked_pos >= FIRMWARE_MAX_IN_FLIGHT:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_UPDATE_TIMEOUT,
                 )
                 notification = FirmwareUpdateNotification.from_bytes(notification_data)
@@ -829,7 +790,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             chunk = compressed_data[sent_pos : sent_pos + chunk_size]
 
             data_ind = FirmwareUpdateDataInd(chunk_data=chunk)
-            await write_packet(data_ind.to_bytes(), True)
+            await self._write_packet(data_ind.to_bytes(), True)
             sent_pos += chunk_size
 
         # Wait for remaining acknowledgments.
@@ -839,7 +800,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         try:
             while acked_pos < total_bytes:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(TWIST_OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_FINAL_ACK_TIMEOUT,
                 )
                 notification = FirmwareUpdateNotification.from_bytes(notification_data)
@@ -863,12 +824,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
     async def send_force_disconnect(
         self,
-        write_packet: WritePacketFn,
         restart_adv: bool = True,
     ) -> None:
         """Send force disconnect to trigger device reboot."""
         ind = ForceBtDisconnectInd(restart_adv=restart_adv)
-        await write_packet(ind.to_bytes(), True)
+        await self._write_packet(ind.to_bytes(), True)
         _LOGGER.debug("Sent ForceBtDisconnectInd (restart_adv=%s)", restart_adv)
 
     def _parse_twist_rotation_event(self, event_data: bytes) -> list[RotateEvent]:
