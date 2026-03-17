@@ -11,7 +11,6 @@ concurrency:
 
 permissions:
   contents: write
-  models: read
   pull-requests: read
 
 jobs:
@@ -80,26 +79,10 @@ jobs:
             echo "bump=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fallback to Copilot if no label
+      - name: Fallback to patch if no label
         id: bump
         if: steps.pr.outputs.number != '' && steps.labels.outputs.bump == ''
-        uses: github/copilot-models@latest
-        with:
-          model: gpt-4o
-          prompt: |
-            You are a semantic versioning assistant. Given the PR title and body below,
-            decide whether this is a "patch", "minor", or "major" bump.
-
-            Rules:
-            - Bug fixes, refactors, docs, CI changes → patch
-            - New features, new public API → minor
-            - Breaking changes to public API → major
-
-            PR title: ${{ steps.pr.outputs.title }}
-            PR body: ${{ steps.pr.outputs.body }}
-
-            Respond with ONLY one word: patch, minor, or major
-          output-variable: bump_type
+        run: echo "bump_type=patch" >> "$GITHUB_OUTPUT"
 
       - name: Calculate new version
         if: steps.pr.outputs.number != ''
