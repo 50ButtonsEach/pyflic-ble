@@ -682,11 +682,21 @@ class FlicClient:
                 # Connection was lost, update state
                 self._flic_state.connected = False
                 self._notify_state_callbacks()
-            try:
-                _LOGGER.debug("Attempting to reconnect to %s", self.address)
-                await self._start_inner()
-            except Exception:  # noqa: BLE001
-                _LOGGER.debug("Reconnection to %s failed", self.address, exc_info=True)
+            delay = 5
+            max_delay = 300
+            while not self.is_connected and not self._stopped:
+                try:
+                    _LOGGER.debug("Attempting to reconnect to %s", self.address)
+                    await self._start_inner()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "Reconnection to %s failed, retrying in %ds",
+                        self.address,
+                        delay,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, max_delay)
 
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
