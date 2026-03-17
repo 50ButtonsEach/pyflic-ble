@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Never
 
 from ..const import (
     DEVICE_NAME_MAX_BYTES,
@@ -74,9 +74,6 @@ WritePacketFn = Callable[[bytes, bool], Awaitable[None]]
 WaitForOpcodesFn = Callable[[list[int]], Awaitable[bytes]]
 WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
 WriteGattFn = Callable[[str, bytes], Awaitable[None]]
-
-
-from typing import Never
 
 
 async def _unbound_transport(*_args: object, **_kwargs: object) -> Never:
@@ -236,6 +233,7 @@ class DeviceProtocolHandler(ABC):
     def reset_state(self) -> None:
         """Reset any handler-specific state (called on disconnect)."""
         self._rotate_tracker = None
+        self._connection_id = 0
         self._write_gatt = _unbound_transport
         self._write_packet = _unbound_transport
         self._wait_for_opcode = _unbound_transport

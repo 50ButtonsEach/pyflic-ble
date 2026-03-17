@@ -1,8 +1,7 @@
 name: Release to PyPI
 
 on:
-  pull_request:
-    types: [closed]
+  push:
     branches: [main]
   workflow_dispatch:
 
@@ -17,13 +16,15 @@ permissions:
 
 jobs:
   determine-version:
-    if: github.event.pull_request.merged == true
+    # Only run when the push is a merged PR (has associated PR number)
+    if: github.event.head_commit.message != '' && contains(github.event.head_commit.message, '#')
     runs-on: ubuntu-latest
 
     outputs:
       current_version: ${{ steps.current.outputs.version }}
       new_version: ${{ steps.newver.outputs.version }}
       bump_type: ${{ steps.newver.outputs.bump }}
+      has_pr: ${{ steps.pr.outputs.number != '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,16 +33,42 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Find merged PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_json=$(gh pr list --state merged --base main --json number,title,body,labels --limit 1 --search "${{ github.sha }}")
+          number=$(echo "$pr_json" | python -c "import json,sys; d=json.load(sys.stdin); print(d[0]['number'] if d else '')")
+          if [ -z "$number" ]; then
+            echo "No merged PR found for this push, skipping release"
+            echo "number=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          title=$(echo "$pr_json" | python -c "import json,sys; print(json.load(sys.stdin)[0]['title'])")
+          body=$(echo "$pr_json" | python -c "import json,sys; print(json.load(sys.stdin)[0]['body'])")
+          labels=$(echo "$pr_json" | python -c "import json,sys; print(json.dumps([l['name'] for l in json.load(sys.stdin)[0]['labels']]))")
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<PREOF"
+            echo "$body"
+            echo "PREOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "labels=$labels" >> "$GITHUB_OUTPUT"
+
       - name: Get current version
+        if: steps.pr.outputs.number != ''
         id: current
         run: |
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Determine version bump from PR labels
+        if: steps.pr.outputs.number != ''
         id: labels
         run: |
-          labels='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          labels='${{ steps.pr.outputs.labels }}'
           if echo "$labels" | grep -q '"major"'; then
             echo "bump=major" >> "$GITHUB_OUTPUT"
           elif echo "$labels" | grep -q '"minor"'; then
@@ -54,7 +81,7 @@ jobs:
 
       - name: Fallback to Copilot if no label
         id: bump
-        if: steps.labels.outputs.bump == ''
+        if: steps.pr.outputs.number != '' && steps.labels.outputs.bump == ''
         uses: github/copilot-models@v1
         with:
           model: gpt-4o
@@ -67,13 +94,14 @@ jobs:
             - New features, new public API → minor
             - Breaking changes to public API → major
 
-            PR title: ${{ github.event.pull_request.title }}
-            PR body: ${{ github.event.pull_request.body }}
+            PR title: ${{ steps.pr.outputs.title }}
+            PR body: ${{ steps.pr.outputs.body }}
 
             Respond with ONLY one word: patch, minor, or major
           output-variable: bump_type
 
       - name: Calculate new version
+        if: steps.pr.outputs.number != ''
         id: newver
         run: |
           current="${{ steps.current.outputs.version }}"
@@ -97,13 +125,13 @@ jobs:
   publish:
     if: github.event_name == 'workflow_dispatch'
     needs: determine-version
+    if: needs.determine-version.outputs.new_version != ''
     runs-on: ubuntu-latest
     environment: pypi
 
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -134,9 +162,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout main
-          git pull --ff-only origin main
-          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
           git add pyproject.toml
           git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
           git tag "v${{ needs.determine-version.outputs.new_version }}"

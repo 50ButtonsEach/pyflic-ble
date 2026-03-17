@@ -428,6 +428,8 @@ class FlicClient:
                 firmware_version,
             ) = await self._handler.full_verify_pairing()
 
+            # Handler resets its connection_id to 0 after pairing; sync client
+            self._connection_id = 0
             self._pairing_id = pairing_id
             self._pairing_key = pairing_key
             self._sig_bits = sig_bits
