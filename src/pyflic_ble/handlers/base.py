@@ -76,6 +76,11 @@ WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
 WriteGattFn = Callable[[str, bytes], Awaitable[None]]
 
 
+def _unbound_transport(*_args: object, **_kwargs: object) -> None:
+    """Sentinel that raises when transport callbacks are used before bind_transport()."""
+    raise RuntimeError("Transport not bound — call bind_transport() before using handler")
+
+
 class DeviceProtocolHandler(ABC):
     """Abstract base class for device-specific protocol handlers."""
 
@@ -83,10 +88,10 @@ class DeviceProtocolHandler(ABC):
         """Initialize the handler."""
         self._rotate_tracker: RotateTracker | None = None
         self._connection_id: int = 0
-        self._write_gatt: WriteGattFn | None = None
-        self._write_packet: WritePacketFn | None = None
-        self._wait_for_opcode: WaitForOpcodeFn | None = None
-        self._wait_for_opcodes: WaitForOpcodesFn | None = None
+        self._write_gatt: WriteGattFn = _unbound_transport  # type: ignore[assignment]
+        self._write_packet: WritePacketFn = _unbound_transport  # type: ignore[assignment]
+        self._wait_for_opcode: WaitForOpcodeFn = _unbound_transport  # type: ignore[assignment]
+        self._wait_for_opcodes: WaitForOpcodesFn = _unbound_transport  # type: ignore[assignment]
 
     @property
     def connection_id(self) -> int:

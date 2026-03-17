@@ -5,6 +5,10 @@ on:
     types: [closed]
     branches: [main]
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   models: read
@@ -88,8 +92,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install build tools
-        run: pip install build twine
+      - name: Install dependencies
+        run: pip install build twine -e ".[dev]" || pip install build twine -e .
+
+      - name: Run tests
+        run: python -m pytest tests/
 
       - name: Update version in pyproject.toml
         run: |

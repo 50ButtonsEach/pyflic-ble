@@ -10,7 +10,7 @@ from enum import IntEnum
 import logging
 from typing import Any
 
-from bleak import BleakClient, BleakError
+from bleak import BleakError
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import (
     close_stale_connections_by_address,
@@ -264,7 +264,7 @@ class FlicClient:
             _LOGGER.info("Connecting to Flic button at %s", self.address)
             await close_stale_connections_by_address(self.address)
             self._client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 self.ble_device,
                 self.address,
                 disconnected_callback=self._handle_disconnected,
@@ -350,7 +350,7 @@ class FlicClient:
                 self._state = SessionState.DISCONNECTED
                 self._handler.reset_state()
 
-    def _handle_disconnected(self, _client: BleakClient) -> None:
+    def _handle_disconnected(self, _client: BleakClientWithServiceCache) -> None:
         """Handle BLE disconnection event from Bleak."""
         if self._intentional_disconnect:
             self._intentional_disconnect = False
