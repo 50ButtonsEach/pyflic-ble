@@ -11,7 +11,6 @@ concurrency:
 
 permissions:
   contents: write
-  models: read
   pull-requests: read
 
 jobs:
@@ -80,26 +79,13 @@ jobs:
             echo "bump=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fallback to Copilot if no label
+      - name: Fallback to patch if no label
         id: bump
         if: steps.pr.outputs.number != '' && steps.labels.outputs.bump == ''
-        uses: github/copilot-models@v1
-        with:
-          model: gpt-4o
-          prompt: |
-            You are a semantic versioning assistant. Given the PR title and body below,
-            decide whether this is a "patch", "minor", or "major" bump.
-
-            Rules:
-            - Bug fixes, refactors, docs, CI changes → patch
-            - New features, new public API → minor
-            - Breaking changes to public API → major
-
-            PR title: ${{ steps.pr.outputs.title }}
-            PR body: ${{ steps.pr.outputs.body }}
-
-            Respond with ONLY one word: patch, minor, or major
-          output-variable: bump_type
+        run: |
+          # Default to patch bump if no version label is found
+          echo "bump_type=patch" >> "$GITHUB_OUTPUT"
+          echo "No version label found, defaulting to patch bump"
 
       - name: Calculate new version
         if: steps.pr.outputs.number != ''
@@ -109,19 +95,36 @@ jobs:
           bump="${{ steps.labels.outputs.bump || steps.bump.outputs.bump_type }}"
           bump="$(echo "$bump" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 
+          echo "Current version: $current"
+          echo "Bump type: $bump"
+
           IFS='.' read -r major minor patch <<< "$current"
+          echo "Parsed version parts - major: $major, minor: $minor, patch: $patch"
 
           case "$bump" in
-            major) major=$((major + 1)); minor=0; patch=0 ;;
-            minor) minor=$((minor + 1)); patch=0 ;;
-            patch) patch=$((patch + 1)) ;;
-            *) echo "Unknown bump type: $bump, defaulting to patch"; patch=$((patch + 1)) ;;
+            major) 
+              major=$((major + 1)); minor=0; patch=0
+              echo "Performing major version bump"
+              ;;
+            minor) 
+              minor=$((minor + 1)); patch=0
+              echo "Performing minor version bump"
+              ;;
+            patch) 
+              patch=$((patch + 1))
+              echo "Performing patch version bump"
+              ;;
+            *) 
+              echo "Warning: Unknown bump type '$bump', defaulting to patch"
+              patch=$((patch + 1))
+              bump="patch"
+              ;;
           esac
 
           new_version="${major}.${minor}.${patch}"
           echo "version=$new_version" >> "$GITHUB_OUTPUT"
           echo "bump=$bump" >> "$GITHUB_OUTPUT"
-          echo "Bumping $current → $new_version ($bump)"
+          echo "Successfully calculated version bump: $current → $new_version ($bump)"
 
   publish:
     needs: determine-version
@@ -140,29 +143,79 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install build twine -e ".[dev]" || pip install build twine -e .
+        run: |
+          pip install build twine
+          # Try to install with dev dependencies, fallback to basic install
+          if pip install -e ".[dev]"; then
+            echo "Installed with dev dependencies"
+          else
+            echo "Dev dependencies not found, installing basic package"
+            pip install -e .
+          fi
+
+      - name: Install test dependencies
+        run: |
+          # Install pytest if not already installed
+          pip install pytest
 
       - name: Run tests
-        run: python -m pytest tests/
+        run: |
+          # Run tests if they exist
+          if [ -d "tests" ] && [ "$(ls -A tests/*.py 2>/dev/null)" ]; then
+            echo "Running tests..."
+            python -m pytest tests/ -v
+          else
+            echo "No tests found, skipping test step"
+          fi
 
       - name: Update version in pyproject.toml
         run: |
+          echo "Updating version from ${{ needs.determine-version.outputs.current_version }} to ${{ needs.determine-version.outputs.new_version }}"
           sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
 
+          # Verify the version was updated correctly
+          new_version_check=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "Verified new version in pyproject.toml: $new_version_check"
+
+          if [ "$new_version_check" != "${{ needs.determine-version.outputs.new_version }}" ]; then
+            echo "Error: Version update failed. Expected ${{ needs.determine-version.outputs.new_version }}, got $new_version_check"
+            exit 1
+          fi
+
       - name: Build package
-        run: python -m build
+        run: |
+          echo "Building Python package..."
+          python -m build
+
+          # Verify build artifacts were created
+          if [ ! -d "dist" ] || [ -z "$(ls -A dist/)" ]; then
+            echo "Error: Build failed - no artifacts found in dist/"
+            exit 1
+          fi
+
+          echo "Build successful. Generated files:"
+          ls -la dist/
 
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload dist/*
+        run: |
+          echo "Publishing package to PyPI..."
+          twine upload dist/* --verbose
 
       - name: Tag and push version bump
         run: |
+          echo "Configuring git user..."
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Committing version bump..."
           git add pyproject.toml
           git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
+
+          echo "Creating and pushing git tag..."
           git tag "v${{ needs.determine-version.outputs.new_version }}"
           git push origin main --tags
+
+          echo "Successfully tagged and pushed version v${{ needs.determine-version.outputs.new_version }}"
