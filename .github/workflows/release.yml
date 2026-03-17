@@ -1,0 +1,114 @@
+name: Release to PyPI
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+  models: read
+  pull-requests: read
+
+jobs:
+  determine-version:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    outputs:
+      current_version: ${{ steps.current.outputs.version }}
+      new_version: ${{ steps.newver.outputs.version }}
+      bump_type: ${{ steps.newver.outputs.bump }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Get current version
+        id: current
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Determine version bump with Copilot
+        id: bump
+        uses: github/copilot-models@v1
+        with:
+          model: gpt-4o
+          prompt: |
+            You are a semantic versioning assistant. Given the PR title and body below,
+            decide whether this is a "patch", "minor", or "major" bump.
+
+            Rules:
+            - Bug fixes, refactors, docs, CI changes → patch
+            - New features, new public API → minor
+            - Breaking changes to public API → major
+
+            PR title: ${{ github.event.pull_request.title }}
+            PR body: ${{ github.event.pull_request.body }}
+
+            Respond with ONLY one word: patch, minor, or major
+          output-variable: bump_type
+
+      - name: Calculate new version
+        id: newver
+        run: |
+          current="${{ steps.current.outputs.version }}"
+          bump="$(echo '${{ steps.bump.outputs.bump_type }}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+
+          IFS='.' read -r major minor patch <<< "$current"
+
+          case "$bump" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *) echo "Unknown bump type: $bump, defaulting to patch"; patch=$((patch + 1)) ;;
+          esac
+
+          new_version="${major}.${minor}.${patch}"
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "Bumping $current → $new_version ($bump)"
+
+  publish:
+    needs: determine-version
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Update version in pyproject.toml
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
+          git tag "v${{ needs.determine-version.outputs.new_version }}"
+          git push origin main --tags
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload dist/*

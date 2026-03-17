@@ -82,6 +82,34 @@ class DeviceProtocolHandler(ABC):
     def __init__(self) -> None:
         """Initialize the handler."""
         self._rotate_tracker: RotateTracker | None = None
+        self._connection_id: int = 0
+        self._write_gatt: WriteGattFn | None = None
+        self._write_packet: WritePacketFn | None = None
+        self._wait_for_opcode: WaitForOpcodeFn | None = None
+        self._wait_for_opcodes: WaitForOpcodesFn | None = None
+
+    @property
+    def connection_id(self) -> int:
+        """Return the current connection ID."""
+        return self._connection_id
+
+    @connection_id.setter
+    def connection_id(self, value: int) -> None:
+        """Set the connection ID."""
+        self._connection_id = value
+
+    def bind_transport(
+        self,
+        write_gatt: WriteGattFn,
+        write_packet: WritePacketFn,
+        wait_for_opcode: WaitForOpcodeFn,
+        wait_for_opcodes: WaitForOpcodesFn,
+    ) -> None:
+        """Bind transport callbacks for use by handler methods."""
+        self._write_gatt = write_gatt
+        self._write_packet = write_packet
+        self._wait_for_opcode = wait_for_opcode
+        self._wait_for_opcodes = wait_for_opcodes
 
     @property
     @abstractmethod
@@ -111,10 +139,6 @@ class DeviceProtocolHandler(ABC):
     @abstractmethod
     async def full_verify_pairing(
         self,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> tuple[int, bytes, str, int, int, bytes, int]:
         """Perform full pairing verification."""
 
@@ -123,9 +147,6 @@ class DeviceProtocolHandler(ABC):
         self,
         pairing_id: int,
         pairing_key: bytes,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        write_packet: WritePacketFn,
         sig_bits: int = 0,
     ) -> tuple[bytes, list[int]]:
         """Perform quick verification using stored credentials."""
@@ -133,39 +154,23 @@ class DeviceProtocolHandler(ABC):
     @abstractmethod
     async def init_button_events(
         self,
-        connection_id: int,
         session_key: bytes | None,
         chaskey_keys: list[int] | None,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> None:
         """Initialize button event delivery."""
 
     @abstractmethod
-    async def get_battery_level(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_battery_level(self) -> int:
         """Request and return the battery level from the device."""
 
     @abstractmethod
-    async def get_firmware_version(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> int:
+    async def get_firmware_version(self) -> int:
         """Request and return the firmware version from the device."""
 
     @abstractmethod
     def handle_notification(
         self,
         data: bytes,
-        connection_id: int,
     ) -> tuple[list[ButtonEvent], list[RotateEvent], int | None]:
         """Handle a notification from the device."""
 
@@ -173,8 +178,6 @@ class DeviceProtocolHandler(ABC):
     async def start_firmware_update(
         self,
         firmware_binary: bytes,
-        write_packet: WritePacketFn,
-        wait_for_opcodes: WaitForOpcodesFn,
     ) -> int:
         """Start a firmware update on the device."""
 
@@ -183,8 +186,6 @@ class DeviceProtocolHandler(ABC):
         self,
         firmware_binary: bytes,
         start_pos: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
         """Send firmware data chunks to the device."""
@@ -192,29 +193,32 @@ class DeviceProtocolHandler(ABC):
     @abstractmethod
     async def send_force_disconnect(
         self,
-        write_packet: WritePacketFn,
         restart_adv: bool = True,
     ) -> None:
         """Send force disconnect to trigger device reboot."""
 
     @abstractmethod
-    async def get_name(
-        self,
-        connection_id: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
-    ) -> tuple[str, int]:
+    async def get_name(self) -> tuple[str, int]:
         """Request and return the device name."""
 
     @abstractmethod
     async def set_name(
         self,
-        connection_id: int,
         name: str,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
     ) -> tuple[str, int]:
         """Set the device name."""
+
+    async def set_connection_parameters(
+        self,
+        intv_min: int,
+        intv_max: int,
+        latency: int,
+        timeout: int,
+    ) -> None:
+        """Send Flic protocol connection parameters to the button.
+
+        No-op by default; overridden by Flic 2/Duo handlers.
+        """
 
     @property
     def push_twist_mode(self) -> PushTwistMode | None:

@@ -50,10 +50,6 @@ from .base import (
     ButtonEvent,
     DeviceCapabilities,
     RotateEvent,
-    WaitForOpcodeFn,
-    WaitForOpcodesFn,
-    WriteGattFn,
-    WritePacketFn,
 )
 from .flic2 import Flic2ProtocolHandler
 
@@ -110,16 +106,10 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
 
     async def init_button_events(
         self,
-        connection_id: int,
         session_key: bytes | None,
         chaskey_keys: list[int] | None,
-        write_gatt: WriteGattFn,
-        wait_for_opcode: WaitForOpcodeFn,
-        wait_for_opcodes: WaitForOpcodesFn,
-        write_packet: WritePacketFn,
     ) -> None:
         """Initialize button events for Flic Duo."""
-        self._connection_id = connection_id
         self._duo_parser_state = DuoParserState()
         # Duo dials: one per button, 120 degrees = 100%, clamped to 0-100
         self._rotate_trackers = {
@@ -152,11 +142,11 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             OPCODE_INIT_BUTTON_EVENTS_DUO_REQUEST,
             len(request),
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
 
         try:
             response = await asyncio.wait_for(
-                wait_for_opcodes(
+                self._wait_for_opcodes(
                     [
                         OPCODE_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID,
                         OPCODE_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
@@ -175,9 +165,9 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             )
 
         # Enable push twist (rotation) events
-        await self._init_push_twist_events(write_packet)
+        await self._init_push_twist_events()
 
-    async def _init_push_twist_events(self, write_packet: WritePacketFn) -> None:
+    async def _init_push_twist_events(self) -> None:
         """Initialize push twist (rotation) events for Flic Duo."""
         request_msg = EnablePushTwistRequest(
             connection_id=self._connection_id,
@@ -191,7 +181,7 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             request[1],
             len(request),
         )
-        await write_packet(request, True)
+        await self._write_packet(request, True)
         _LOGGER.debug("Push twist events enabled")
 
     def _build_firmware_start_packet(self, firmware_binary: bytes) -> bytes:
@@ -204,8 +194,6 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
         self,
         firmware_binary: bytes,
         start_pos: int,
-        write_packet: WritePacketFn,
-        wait_for_opcode: WaitForOpcodeFn,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> bool:
         """Send firmware data to a Duo device with byte-based flow control."""
@@ -224,7 +212,7 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             # Flow control: wait if too many bytes in flight
             while sent_pos - acked_pos >= DUO_FIRMWARE_MAX_IN_FLIGHT:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_UPDATE_TIMEOUT,
                 )
                 # Strip frame header for parsing
@@ -254,7 +242,7 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             data_ind = DuoFirmwareUpdateDataInd(
                 connection_id=self._connection_id, chunk_data=chunk
             )
-            await write_packet(data_ind.to_bytes(), True)
+            await self._write_packet(data_ind.to_bytes(), True)
             sent_pos += chunk_size
 
         # Wait for remaining acknowledgments.
@@ -264,7 +252,7 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
         try:
             while acked_pos < total_bytes:
                 notification_data = await asyncio.wait_for(
-                    wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
+                    self._wait_for_opcode(OPCODE_FIRMWARE_UPDATE_NOTIFICATION),
                     timeout=FIRMWARE_FINAL_ACK_TIMEOUT,
                 )
                 notification = FirmwareUpdateNotification.from_bytes(
@@ -291,7 +279,6 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
     def handle_notification(
         self,
         data: bytes,
-        connection_id: int,
     ) -> tuple[list[ButtonEvent], list[RotateEvent], int | None]:
         """Handle a notification from a Flic Duo button."""
         button_events: list[ButtonEvent] = []
