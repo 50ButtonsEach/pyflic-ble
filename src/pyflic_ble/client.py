@@ -183,6 +183,7 @@ class FlicClient:
 
         # Connection lifecycle state
         self._reconnect_lock = asyncio.Lock()
+        self._reconnect_event = asyncio.Event()
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -663,31 +664,34 @@ class FlicClient:
         """Update the BLE device reference.
 
         If disconnected, automatically triggers a reconnection attempt.
+        Wakes any sleeping reconnect loop to retry immediately.
         """
         self.ble_device = ble_device
+        self._reconnect_event.set()
         if not self.is_connected and not self._starting and not self._stopped:
             loop = asyncio.get_running_loop()
             loop.create_task(self.async_reconnect())
 
     async def async_reconnect(self) -> None:
-        """Attempt reconnection with lock to prevent concurrent attempts.
+        """Attempt reconnection with exponential backoff.
 
         Safe to call repeatedly — the lock ensures only one attempt runs
-        at a time, and a no-op if already connected or stopped.
+        at a time. set_ble_device() wakes the backoff sleep to retry
+        immediately with the fresh BLEDevice.
         """
-        async with self._reconnect_lock:
-            if self.is_connected or self._stopped:
-                return
-            if self._flic_state.connected:
-                # Connection was lost, update state
-                self._flic_state.connected = False
-                self._notify_state_callbacks()
-            delay = 5
-            max_delay = 300
-            while not self.is_connected and not self._stopped:
+        delay = 5
+        max_delay = 300
+        while not self.is_connected and not self._stopped:
+            async with self._reconnect_lock:
+                if self.is_connected or self._stopped:
+                    return
+                if self._flic_state.connected:
+                    self._flic_state.connected = False
+                    self._notify_state_callbacks()
                 try:
                     _LOGGER.debug("Attempting to reconnect to %s", self.address)
                     await self._start_inner()
+                    return
                 except Exception:  # noqa: BLE001
                     _LOGGER.debug(
                         "Reconnection to %s failed, retrying in %ds",
@@ -695,8 +699,17 @@ class FlicClient:
                         delay,
                         exc_info=True,
                     )
-                    await asyncio.sleep(delay)
-                    delay = min(delay * 2, max_delay)
+
+            # Sleep outside the lock; woken early by set_ble_device()
+            self._reconnect_event.clear()
+            try:
+                await asyncio.wait_for(
+                    self._reconnect_event.wait(), timeout=delay
+                )
+                # Woken by new advertisement — reset backoff
+                delay = 5
+            except TimeoutError:
+                delay = min(delay * 2, max_delay)
 
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
