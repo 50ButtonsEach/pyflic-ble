@@ -184,6 +184,7 @@ class FlicClient:
         # Connection lifecycle state
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -232,8 +233,12 @@ class FlicClient:
         # (e.g. after firmware update reboot or unexpected disconnect)
         if self._client:
             _LOGGER.debug("Cleaning up stale connection to %s", self.address)
+            # Mark intentional to prevent _handle_disconnected from firing
+            # during stale cleanup (it would re-enter reconnect logic).
+            self._intentional_disconnect = True
             with contextlib.suppress(BleakError):
                 await self._client.disconnect()
+            self._intentional_disconnect = False
 
             # Re-check after await: a firmware update may have started on
             # another FlicClient for this address during the disconnect.
@@ -368,8 +373,7 @@ class FlicClient:
             self.on_disconnect()
         # Attempt reconnection unless start() is already running or stopped
         if not self._starting and not self._stopped:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.async_reconnect())
+            self._schedule_reconnect()
 
     async def _request_connection_parameters(self) -> None:
         """Request BLE connection parameters for optimal communication."""
@@ -660,6 +664,9 @@ class FlicClient:
         """Disconnect and clean up."""
         self._stopped = True
         self._flic_state.connected = False
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         await self.disconnect()
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
@@ -671,8 +678,33 @@ class FlicClient:
         self.ble_device = ble_device
         self._reconnect_event.set()
         if not self.is_connected and not self._starting and not self._stopped:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.async_reconnect())
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnect task if one is not already running."""
+        if self._reconnect_task and not self._reconnect_task.done():
+            _LOGGER.debug(
+                "Reconnect task already running for %s, skipping", self.address
+            )
+            return
+        loop = asyncio.get_running_loop()
+        self._reconnect_task = loop.create_task(
+            self._async_reconnect_loop(),
+            name=f"flic-reconnect-{self.address}",
+        )
+
+    async def _async_reconnect_loop(self) -> None:
+        """Reconnect loop wrapper that catches all exceptions."""
+        try:
+            await self.async_reconnect()
+        except asyncio.CancelledError:
+            _LOGGER.info(
+                "Reconnect task for %s was cancelled", self.address
+            )
+        except BaseException:
+            _LOGGER.exception(
+                "Unexpected error in reconnect loop for %s", self.address
+            )
 
     async def async_reconnect(self) -> None:
         """Attempt reconnection with exponential backoff.
@@ -683,6 +715,9 @@ class FlicClient:
         """
         delay = 5
         max_delay = 300
+        _LOGGER.debug(
+            "Starting reconnect loop for %s", self.address
+        )
         while not self.is_connected and not self._stopped:
             async with self._reconnect_lock:
                 if self.is_connected or self._stopped:
@@ -691,7 +726,9 @@ class FlicClient:
                     self._flic_state.connected = False
                     self._notify_state_callbacks()
                 try:
-                    _LOGGER.debug("Attempting to reconnect to %s", self.address)
+                    _LOGGER.debug(
+                        "Attempting to reconnect to %s", self.address
+                    )
                     await self._start_inner()
                     return
                 except Exception:  # noqa: BLE001
@@ -703,7 +740,7 @@ class FlicClient:
                     )
 
             # Sleep outside the lock; woken early by set_ble_device()
-            self._reconnect_event.clear()
+            # Clear AFTER wait so a signal set during _start_inner() is not lost.
             try:
                 await asyncio.wait_for(
                     self._reconnect_event.wait(), timeout=delay
@@ -712,6 +749,8 @@ class FlicClient:
                 delay = 5
             except TimeoutError:
                 delay = min(delay * 2, max_delay)
+            finally:
+                self._reconnect_event.clear()
 
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
