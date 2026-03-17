@@ -910,6 +910,7 @@ class FlicClient:
 
         if newly_assigned:
             self._connection_id = conn_id
+            self._handler.connection_id = conn_id
             _LOGGER.debug("Connection ID assigned by button: %d", conn_id)
 
         # Handle fragmented packets
