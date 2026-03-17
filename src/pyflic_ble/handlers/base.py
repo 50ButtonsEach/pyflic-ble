@@ -76,7 +76,10 @@ WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
 WriteGattFn = Callable[[str, bytes], Awaitable[None]]
 
 
-async def _unbound_transport(*_args: object, **_kwargs: object) -> None:
+from typing import Never
+
+
+async def _unbound_transport(*_args: object, **_kwargs: object) -> Never:
     """Sentinel that raises when transport callbacks are used before bind_transport()."""
     raise RuntimeError("Transport not bound — call bind_transport() before using handler")
 
@@ -88,10 +91,10 @@ class DeviceProtocolHandler(ABC):
         """Initialize the handler."""
         self._rotate_tracker: RotateTracker | None = None
         self._connection_id: int = 0
-        self._write_gatt: WriteGattFn = _unbound_transport  # type: ignore[assignment]
-        self._write_packet: WritePacketFn = _unbound_transport  # type: ignore[assignment]
-        self._wait_for_opcode: WaitForOpcodeFn = _unbound_transport  # type: ignore[assignment]
-        self._wait_for_opcodes: WaitForOpcodesFn = _unbound_transport  # type: ignore[assignment]
+        self._write_gatt: WriteGattFn = _unbound_transport
+        self._write_packet: WritePacketFn = _unbound_transport
+        self._wait_for_opcode: WaitForOpcodeFn = _unbound_transport
+        self._wait_for_opcodes: WaitForOpcodesFn = _unbound_transport
 
     @property
     def connection_id(self) -> int:
@@ -233,10 +236,10 @@ class DeviceProtocolHandler(ABC):
     def reset_state(self) -> None:
         """Reset any handler-specific state (called on disconnect)."""
         self._rotate_tracker = None
-        self._write_gatt = _unbound_transport  # type: ignore[assignment]
-        self._write_packet = _unbound_transport  # type: ignore[assignment]
-        self._wait_for_opcode = _unbound_transport  # type: ignore[assignment]
-        self._wait_for_opcodes = _unbound_transport  # type: ignore[assignment]
+        self._write_gatt = _unbound_transport
+        self._write_packet = _unbound_transport
+        self._wait_for_opcode = _unbound_transport
+        self._wait_for_opcodes = _unbound_transport
 
     @staticmethod
     def _truncate_name_bytes(name: str) -> bytes:

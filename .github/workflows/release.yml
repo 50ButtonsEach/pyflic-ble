@@ -132,7 +132,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git pull --ff-only origin main
+          sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
           git add pyproject.toml
           git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
           git tag "v${{ needs.determine-version.outputs.new_version }}"
-          git push origin HEAD:main --tags
+          git push origin main --tags
