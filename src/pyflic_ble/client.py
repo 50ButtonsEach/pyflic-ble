@@ -316,6 +316,8 @@ class FlicClient:
             _LOGGER.debug("Notifications started successfully for %s", self.address)
 
             self._state = SessionState.CONNECTED
+            self._connection_id = 0
+            self._handler.connection_id = 0
             self._packet_counter_to_button = 0
             self._packet_counter_from_button = 0
 
