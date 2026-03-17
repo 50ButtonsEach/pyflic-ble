@@ -120,9 +120,9 @@ pairing_id, pairing_key, serial, battery, sig_bits, button_uuid, firmware_versio
 await client.init_button_events()
 ```
 
-### Starting a Session (Recommended)
+### Reconnecting (Subsequent Connections)
 
-`start()` handles the full connection lifecycle in a single call: connect, quick verify, init button events, and read battery/firmware/name.
+Quick verify uses stored pairing credentials for fast reconnection without user interaction.
 
 ```python
 client = FlicClient(
@@ -134,14 +134,6 @@ client = FlicClient(
     sig_bits=saved_sig_bits,
 )
 
-await client.start()
-```
-
-### Reconnecting (Subsequent Connections)
-
-Quick verify uses stored pairing credentials for fast reconnection without user interaction. This is what `start()` calls internally, shown here for lower-level control.
-
-```python
 await client.connect()
 await client.quick_verify()
 await client.init_button_events()
@@ -268,22 +260,11 @@ The firmware update process:
 
 During a firmware update, all other `FlicClient` instances are blocked from connecting to the same BLE address to prevent interference.
 
-### Automatic Reconnection
-
-When a BLE connection drops unexpectedly, the client automatically attempts to reconnect with exponential backoff (5 s → 300 s max). Call `set_ble_device()` when a new BLE advertisement arrives to provide a fresh device reference and wake the reconnect loop for an immediate retry:
-
-```python
-# Typically called from a BLE scanner callback
-client.set_ble_device(new_ble_device)
-```
-
-The reconnect loop runs until the connection is restored or `stop()` is called. No manual intervention is needed.
-
-### Disconnect Callback
+### Disconnect Handling
 
 ```python
 def on_disconnect():
-    print("Connection lost — reconnecting automatically")
+    print("Connection lost — will need to reconnect")
 
 client.on_disconnect = on_disconnect
 ```
@@ -335,13 +316,6 @@ DISCONNECTED → connect() → CONNECTED
     → quick_verify() → SESSION_ESTABLISHED          (known device)
         → init_button_events()                      (start receiving events)
         → disconnect() → DISCONNECTED
-
-Automatic reconnection (after unexpected disconnect):
-DISCONNECTED → async_reconnect() ←─ backoff loop ──╮
-    → _start_inner() → CONNECTED → SESSION_ESTABLISHED
-    │  (failure) ─────────────────────────────────────╯
-    │  set_ble_device() wakes loop for immediate retry
-    → stop() → DISCONNECTED (loop exits)
 ```
 
 ## Development
