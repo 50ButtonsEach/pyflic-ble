@@ -16,8 +16,9 @@ permissions:
 
 jobs:
   determine-version:
-    # Only run when the push is a merged PR (has associated PR number)
-    if: github.event.head_commit.message != '' && contains(github.event.head_commit.message, '#')
+    # Only run when the push is a merged PR (has associated PR number),
+    # or always when triggered manually via workflow_dispatch
+    if: github.event_name == 'workflow_dispatch' || (github.event.head_commit.message != '' && contains(github.event.head_commit.message, '#'))
     runs-on: ubuntu-latest
 
     outputs:
