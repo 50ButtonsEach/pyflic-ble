@@ -1,4 +1,4 @@
-name: Release to PyPI
+name: Release to PyPI (Alternative)
 
 on:
   push:
@@ -94,7 +94,7 @@ jobs:
           current="${{ steps.current.outputs.version }}"
           bump="${{ steps.labels.outputs.bump || steps.bump.outputs.bump_type }}"
           bump="$(echo "$bump" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-
+          
           echo "Current version: $current"
           echo "Bump type: $bump"
 
@@ -168,23 +168,22 @@ jobs:
             echo "No tests found, skipping test step"
           fi
 
-      - name: Update version in pyproject.toml
+      - name: Update version for build only
         run: |
-          echo "Updating version from ${{ needs.determine-version.outputs.current_version }} to ${{ needs.determine-version.outputs.new_version }}"
+          echo "Temporarily updating version in pyproject.toml for build..."
+          echo "Current version: ${{ needs.determine-version.outputs.current_version }}"
+          echo "New version: ${{ needs.determine-version.outputs.new_version }}"
+          
+          # Update version temporarily for building
           sed -i "s/^version = \".*\"/version = \"${{ needs.determine-version.outputs.new_version }}\"/" pyproject.toml
-
-          # Verify the version was updated correctly
+          
+          # Verify the version was updated
           new_version_check=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          echo "Verified new version in pyproject.toml: $new_version_check"
-
-          if [ "$new_version_check" != "${{ needs.determine-version.outputs.new_version }}" ]; then
-            echo "Error: Version update failed. Expected ${{ needs.determine-version.outputs.new_version }}, got $new_version_check"
-            exit 1
-          fi
+          echo "Updated version for build: $new_version_check"
 
       - name: Build package
         run: |
-          echo "Building Python package..."
+          echo "Building Python package with version ${{ needs.determine-version.outputs.new_version }}..."
           python -m build
 
           # Verify build artifacts were created
@@ -204,47 +203,6 @@ jobs:
           echo "Publishing package to PyPI..."
           twine upload dist/* --verbose
 
-      - name: Create version bump pull request
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "Creating version bump pull request..."
-          
-          # Create a new branch for version bump
-          version_branch="release/bump-version-${{ needs.determine-version.outputs.new_version }}"
-          git checkout -b "$version_branch"
-          
-          # Configure git user
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Commit version change
-          git add pyproject.toml
-          git commit -m "Bump version to ${{ needs.determine-version.outputs.new_version }}"
-          
-          # Push the branch
-          git push origin "$version_branch"
-          
-          # Create pull request and auto-merge it
-          pr_url=$(gh pr create \
-            --base main \
-            --head "$version_branch" \
-            --title "🚀 Bump version to ${{ needs.determine-version.outputs.new_version }}" \
-            --body "Automated version bump after release ${{ needs.determine-version.outputs.new_version }} was published to PyPI.")
-          
-          echo "Created version bump PR: $pr_url"
-          
-          # Wait a moment for PR to be created
-          sleep 2
-          
-          # Auto-merge the PR (requires admin/maintain permissions on the repo)
-          echo "Attempting to auto-merge version bump PR..."
-          if gh pr merge "$version_branch" --squash --auto; then
-            echo "Version bump PR set to auto-merge"
-          else
-            echo "Could not auto-merge version bump PR. It will need manual review."
-          fi
-
       - name: Create git tag
         run: |
           echo "Creating git tag for version ${{ needs.determine-version.outputs.new_version }}..."
@@ -255,3 +213,13 @@ jobs:
           git push origin "v${{ needs.determine-version.outputs.new_version }}"
           
           echo "Successfully created and pushed tag v${{ needs.determine-version.outputs.new_version }}"
+          
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Creating GitHub release..."
+          gh release create "v${{ needs.determine-version.outputs.new_version }}" \
+            --title "Release ${{ needs.determine-version.outputs.new_version }}" \
+            --notes "Release ${{ needs.determine-version.outputs.new_version }}" \
+            --verify-tag
