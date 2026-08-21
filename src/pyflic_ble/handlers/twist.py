@@ -389,11 +389,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 if i == 12:
                     config = TwistModeConfig(
                         led_mode=3,  # SDK default
-                        has_click=True,
-                        has_double_click=True,
+                        has_click=False,
+                        has_double_click=False,
                         extra_leds_after=0,
                         position=0,
-                        timeout_seconds=60,
+                        timeout_seconds=0,
                     )
                 else:
                     config = TwistModeConfig(
@@ -410,23 +410,23 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             for _ in range(13):
                 config = TwistModeConfig(
                     led_mode=2,  # Continuous LED mode
-                    has_click=True,
-                    has_double_click=True,
+                    has_click=False,
+                    has_double_click=False,
                     extra_leds_after=0,
                     position=0,
-                    timeout_seconds=60,
+                    timeout_seconds=0,
                 )
                 mode_configs.append(config)
         else:
-            # Default mode: basic rotation with click events
+            # Default mode: basic rotation without click events
             for _ in range(13):
                 config = TwistModeConfig(
                     led_mode=1,  # SDK default
-                    has_click=True,
-                    has_double_click=True,
+                    has_click=False,
+                    has_double_click=False,
                     extra_leds_after=0,
                     position=0,
-                    timeout_seconds=60,
+                    timeout_seconds=0,
                 )
                 mode_configs.append(config)
 
