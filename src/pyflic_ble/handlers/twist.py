@@ -80,7 +80,7 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
-from ..rotate_tracker import MultiModeRotateTracker
+from ..rotate_tracker import D360, MultiModeRotateTracker
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
@@ -372,13 +372,22 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         chaskey_keys: list[int] | None,
     ) -> None:
         """Initialize button events for Flic Twist."""
-        self._multi_mode_tracker = MultiModeRotateTracker(
-            bound_mode_12=(
-                self._push_twist_mode
-                in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
-            ),
-            wrap_position=(self._push_twist_mode == PushTwistMode.CONTINUOUS),
-        )
+        # The device does not persist rotation positions across a connection; the
+        # hub restores them through the position field below. Keep the existing
+        # tracker so a reconnect resumes where the dial actually is.
+        if self._multi_mode_tracker is None:
+            self._multi_mode_tracker = MultiModeRotateTracker(
+                bound_mode_12=(
+                    self._push_twist_mode
+                    in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
+                ),
+                wrap_position=(self._push_twist_mode == PushTwistMode.CONTINUOUS),
+            )
+
+        positions = [
+            int(self._multi_mode_tracker.get_mode_percentage(index) / 100.0 * D360)
+            for index in range(13)
+        ]
 
         # Build 13 mode configs based on push_twist_mode setting
         mode_configs = []
@@ -392,7 +401,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                         has_click=False,
                         has_double_click=False,
                         extra_leds_after=0,
-                        position=0,
+                        position=positions[i],
                         timeout_seconds=0,
                     )
                 else:
@@ -401,31 +410,31 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                         has_click=True,
                         has_double_click=True,
                         extra_leds_after=0,
-                        position=0,
+                        position=positions[i],
                         timeout_seconds=60,
                     )
                 mode_configs.append(config)
         elif self._push_twist_mode == PushTwistMode.CONTINUOUS:
             # Continuous mode: like default but with wrapping LED mode
-            for _ in range(13):
+            for i in range(13):
                 config = TwistModeConfig(
                     led_mode=2,  # Continuous LED mode
                     has_click=False,
                     has_double_click=False,
                     extra_leds_after=0,
-                    position=0,
+                    position=positions[i],
                     timeout_seconds=0,
                 )
                 mode_configs.append(config)
         else:
             # Default mode: basic rotation without click events
-            for _ in range(13):
+            for i in range(13):
                 config = TwistModeConfig(
                     led_mode=1,  # SDK default
                     has_click=False,
                     has_double_click=False,
                     extra_leds_after=0,
-                    position=0,
+                    position=positions[i],
                     timeout_seconds=0,
                 )
                 mode_configs.append(config)
