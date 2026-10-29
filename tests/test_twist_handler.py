@@ -160,11 +160,11 @@ def test_dropped_position_update_is_resent_with_current_min() -> None:
     handler.handle_notification(_twist_packet(0, 100, update_too_old=True))
     handler.handle_notification(_twist_packet(0, 100, update_too_old=True))
 
-    resends = handler.pop_position_resends()
+    resends = handler.pop_pending_writes()
     assert len(resends) == 1
     assert _new_min(resends[0]) == -(D360 // 2)
     assert struct.unpack_from("<I", resends[0], 8)[0] == 2
-    assert handler.pop_position_resends() == []
+    assert handler.pop_pending_writes() == []
 
 
 def test_client_writes_dropped_position_update_again() -> None:

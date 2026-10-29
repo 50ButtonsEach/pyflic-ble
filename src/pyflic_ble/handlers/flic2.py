@@ -15,12 +15,14 @@ from ..const import (
     FIRMWARE_FINAL_ACK_TIMEOUT,
     FIRMWARE_UPDATE_TIMEOUT,
     FLIC2_ED25519_PUBLIC_KEY,
+    FLIC2_EVENT_SINGLE_CLICK_TIMEOUT,
     FLIC2_FIRMWARE_IV_SIZE,
     FLIC2_FIRMWARE_MAX_IN_FLIGHT_WORDS,
     FLIC2_FIRMWARE_WORD_CHUNK_SIZE,
     FLIC_NOTIFY_CHAR_UUID,
     FLIC_SERVICE_UUID,
     FLIC_WRITE_CHAR_UUID,
+    OPCODE_ACK_BUTTON_EVENTS,
     OPCODE_BUTTON_EVENT,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
     OPCODE_FULL_VERIFY_FAIL_RESPONSE,
@@ -79,6 +81,16 @@ from .base import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _needs_ack(event_encoded: int) -> bool:
+    """Return if the spec requires acknowledging a button event.
+
+    That is a button up with a single or double click, or a single click timeout.
+    """
+    if event_encoded & 0x08:
+        return bool(event_encoded & 0x02)
+    return event_encoded & 0x03 == FLIC2_EVENT_SINGLE_CLICK_TIMEOUT
+
+
 class Flic2ProtocolHandler(DeviceProtocolHandler):
     """Protocol handler for Flic 2 buttons (non-Duo)."""
 
@@ -99,6 +111,12 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         self._boot_id: int = 0
         # Set when the button's boot id was not known at the last init
         self._queued_event_cutoff_ms: int | None = None
+        self._pending_writes: list[bytes] = []
+
+    def pop_pending_writes(self) -> list[bytes]:
+        """Return the acknowledgements to send for handled button events."""
+        writes, self._pending_writes = self._pending_writes, []
+        return writes
 
     @property
     def service_uuid(self) -> str:
@@ -717,6 +735,16 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         )
         # The counter belongs to the last event, and all events are processed
         self._event_count = notification.event_count
+        # One acknowledgement per notification, with the notification's counter
+        if any(_needs_ack(event.event_type) for event in notification.events):
+            self._pending_writes.append(
+                struct.pack(
+                    "<BBI",
+                    self._connection_id & 0x1F,
+                    OPCODE_ACK_BUTTON_EVENTS,
+                    notification.event_count,
+                )
+            )
 
         for idx, event in enumerate(notification.events):
             event_name = self._get_event_name(event.event_type)

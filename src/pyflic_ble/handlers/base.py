@@ -243,6 +243,10 @@ class DeviceProtocolHandler(ABC):
         """Return the push twist mode, or None for non-Twist devices."""
         return None
 
+    def pop_pending_writes(self) -> list[bytes]:
+        """Return packets that handling the last notification requires sending."""
+        return []
+
     def reset_state(self) -> None:
         """Reset any handler-specific state (called on disconnect)."""
         self._rotate_tracker = None

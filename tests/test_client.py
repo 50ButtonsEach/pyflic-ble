@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import struct
 from unittest.mock import AsyncMock, MagicMock
 
 from bleak import BleakError
@@ -15,6 +16,8 @@ from pyflic_ble import (
 )
 from pyflic_ble.client import SessionState
 from pyflic_ble.const import (
+    OPCODE_ACK_BUTTON_EVENTS,
+    OPCODE_BUTTON_EVENT,
     OPCODE_DISCONNECT_VERIFIED_LINK,
     OPCODE_PING_REQUEST,
     OPCODE_PING_RESPONSE,
@@ -113,6 +116,7 @@ def _flic2_session(ble_client: MagicMock) -> FlicClient:
     client._client = ble_client
     client._state = SessionState.SESSION_ESTABLISHED
     client._connection_id = 3
+    client._handler.connection_id = 3
     return client
 
 
@@ -168,3 +172,42 @@ def test_flic2_init_never_auto_disconnects() -> None:
 
     request = write_packet.await_args.args[0]
     assert int.from_bytes(request[10:18], byteorder="little") & 0x1FF == 511
+
+
+ACK = bytes([3, OPCODE_ACK_BUTTON_EVENTS]) + struct.pack("<I", 9)
+
+
+@pytest.mark.parametrize(
+    ("event_encoded", "expected_writes"),
+    [
+        pytest.param(0b1010, [ACK], id="up_single_click"),
+        pytest.param(0b1011, [ACK], id="up_double_click"),
+        pytest.param(0b0010, [ACK], id="single_click_timeout"),
+        pytest.param(0b0001, [], id="down"),
+        pytest.param(0b0011, [], id="hold"),
+        pytest.param(0b1000, [], id="up_click_pending"),
+    ],
+)
+def test_flic2_acknowledges_handled_clicks(
+    event_encoded: int, expected_writes: list[bytes]
+) -> None:
+    """Test clicks are acknowledged with the notification's event count."""
+    write_packet = AsyncMock()
+
+    async def run() -> None:
+        client = _flic2_session(_connected_ble_client())
+        client._write_packet = write_packet
+
+        # Session packets end in a 5-byte MAC that the client strips
+        client._handle_framed_notification(
+            bytearray([3, OPCODE_BUTTON_EVENT])
+            + struct.pack("<I", 9)
+            + bytes(6)
+            + bytes([event_encoded])
+            + bytes(5)
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+    assert [call.args[0] for call in write_packet.await_args_list] == expected_writes

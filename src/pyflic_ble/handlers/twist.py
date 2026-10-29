@@ -727,7 +727,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             self._multi_mode_tracker.get_mode_percentage(mode_index)
         )
 
-    def pop_position_resends(self) -> list[bytes]:
+    def pop_pending_writes(self) -> list[bytes]:
         """Return the position updates to send again because the device dropped one."""
         resends = list(self._position_resends.values())
         self._position_resends = {}
@@ -918,6 +918,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         # The device drops a position update whose packet count is too far
         # behind; send the current min again so both sides converge, like the hub
         if notification.last_hub_update_packet_too_old:
+            _LOGGER.debug("Resending a Twist position update the device dropped")
             self._position_resends[notification.twist_mode_index] = (
                 UpdateTwistPositionRequest(
                     twist_mode_index=notification.twist_mode_index,

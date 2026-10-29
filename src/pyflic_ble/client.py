@@ -1097,6 +1097,9 @@ class FlicClient:
         self._emit_button_events(button_events)
         self._emit_rotate_events(rotate_events)
 
+        for request in self._handler.pop_pending_writes():
+            self._run_in_background(self._write_packet(request))
+
         # If no events, this might be a command response
         if not button_events and not rotate_events:
             # Discard firmware update notifications when no update is active.
@@ -1162,14 +1165,12 @@ class FlicClient:
             self._handler.handle_notification(bytes(data))
         )
 
-        if isinstance(self._handler, TwistProtocolHandler):
-            for request in self._handler.pop_position_resends():
-                _LOGGER.debug("Resending a Twist position update the device dropped")
-                self._run_in_background(self._write_packet(request))
-
         # Emit events
         self._emit_button_events(button_events)
         self._emit_rotate_events(rotate_events)
+
+        for request in self._handler.pop_pending_writes():
+            self._run_in_background(self._write_packet(request))
 
         # Emit selector change (Twist only)
         if selector_index is not None and self.on_selector_change:
