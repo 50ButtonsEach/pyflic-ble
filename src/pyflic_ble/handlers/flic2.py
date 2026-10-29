@@ -44,6 +44,7 @@ from ..const import (
     OPCODE_SET_NAME_RESPONSE,
     OPCODE_START_FIRMWARE_UPDATE_RESPONSE,
     PAIRING_TIMEOUT,
+    UNSYNCED_QUEUED_EVENT_MAX_AGE_MS,
 )
 from ..protocol import (
     FirmwareUpdateNotification,
@@ -95,6 +96,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         # processed yet
         self._event_count: int = 0
         self._boot_id: int = 0
+        # Set when the button's boot id was not known at the last init
+        self._queued_event_cutoff_ms: int | None = None
 
     @property
     def service_uuid(self) -> str:
@@ -381,6 +384,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             len(request),
         )
 
+        sent_boot_id = self._boot_id
+        self._queued_event_cutoff_ms = None
         await self._write_packet(request, True)
 
         try:
@@ -411,6 +416,11 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             and len(response) >= 16
         ):
             self._boot_id = struct.unpack_from("<I", response, 12)[0]
+            if self._boot_id != sent_boot_id:
+                timestamp = int.from_bytes(response[2:8], byteorder="little") >> 1
+                self._queued_event_cutoff_ms = (
+                    timestamp * 1000 // 32768 - UNSYNCED_QUEUED_EVENT_MAX_AGE_MS
+                )
 
     async def set_connection_parameters(
         self,
@@ -719,6 +729,14 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
                 event.was_queued,
                 event.was_queued_last,
             )
+
+            if (
+                event.was_queued
+                and self._queued_event_cutoff_ms is not None
+                and event.timestamp_ms < self._queued_event_cutoff_ms
+            ):
+                _LOGGER.debug("Dropping old queued Flic 2 button event %d", idx)
+                continue
 
             ha_event = self._map_event_type(event.event_type)
             if ha_event:

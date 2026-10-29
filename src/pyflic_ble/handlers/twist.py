@@ -52,6 +52,7 @@ from ..const import (
     TWIST_RX_CHAR_UUID,
     TWIST_SERVICE_UUID,
     TWIST_TX_CHAR_UUID,
+    UNSYNCED_QUEUED_EVENT_MAX_AGE_MS,
     PushTwistMode,
 )
 from ..protocol import (
@@ -125,6 +126,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         # processed yet
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
+        # Set when the device's boot id was not known at the last init
+        self._queued_event_cutoff_ms: int | None = None
         self._prev_int_pct: dict[int, int] = {}
         self._position_resends: dict[int, bytes] = {}
 
@@ -462,6 +465,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         )
 
         authenticated = session_key is not None and chaskey_keys is not None
+        sent_boot_id = self._last_boot_id
+        self._queued_event_cutoff_ms = None
         await self._write_packet(request, authenticated)
 
         try:
@@ -474,6 +479,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 init_response = InitButtonEventsResponseV2.from_bytes(response)
                 self._last_event_count = init_response.event_count
                 self._last_boot_id = init_response.boot_id
+                if init_response.boot_id != sent_boot_id:
+                    self._queued_event_cutoff_ms = (
+                        init_response.timestamp * 1000 // 32768
+                        - UNSYNCED_QUEUED_EVENT_MAX_AGE_MS
+                    )
                 _LOGGER.debug(
                     "Twist button events initialized: has_queued=%s, "
                     "event_count=%d, boot_id=%d, api_version=%d",
@@ -656,6 +666,14 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 event.timestamp_ms,
                 event.was_queued,
             )
+
+            if (
+                event.was_queued
+                and self._queued_event_cutoff_ms is not None
+                and event.timestamp_ms < self._queued_event_cutoff_ms
+            ):
+                _LOGGER.debug("Dropping old queued Twist button event %d", idx)
+                continue
 
             # Track mode changes (selector position)
             if event.twist_mode_index != self._twist_mode_index:

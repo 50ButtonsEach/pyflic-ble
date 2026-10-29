@@ -54,6 +54,11 @@ FLIC_MTU: Final = 140  # Maximum ATT MTU
 FLIC_MAX_PACKET_SIZE: Final = 129  # Maximum packet size (140 - 11 ATT overhead)
 FLIC_SIGNATURE_SIZE: Final = 5  # Chaskey-LTS MAC size for packets
 
+# When the button's boot id is not known yet, as after a restart, it re-sends all
+# events it holds, including ones already processed; queued events older than
+# this at connect are dropped
+UNSYNCED_QUEUED_EVENT_MAX_AGE_MS: Final = 15_000
+
 # Frame header bitmasks (Flic 2/Duo framing)
 FRAME_HEADER_CONN_ID_MASK: Final = 0x1F
 FRAME_HEADER_NEWLY_ASSIGNED: Final = 0x20
