@@ -96,7 +96,9 @@ def test_flic2_reconnect_resumes_after_processed_events() -> None:
     first_init = _connect(handler, init_response)
     assert struct.unpack_from("<II", first_init, 2) == (0, 0)
 
-    handler.handle_notification(bytes([0x00, OPCODE_BUTTON_EVENT]) + struct.pack("<I", 9))
+    handler.handle_notification(
+        bytes([0x00, OPCODE_BUTTON_EVENT]) + struct.pack("<I", 9)
+    )
 
     second_init = _connect(handler, init_response)
     assert struct.unpack_from("<II", second_init, 2) == (9, BOOT_ID)
@@ -145,8 +147,7 @@ def _flic2_queued_downs(*seconds: int) -> bytes:
         bytes([0x00, OPCODE_BUTTON_EVENT])
         + struct.pack("<I", 9)
         + b"".join(
-            (second * TICKS_PER_SECOND).to_bytes(6, byteorder="little")
-            + bytes([0x11])
+            (second * TICKS_PER_SECOND).to_bytes(6, byteorder="little") + bytes([0x11])
             for second in seconds
         )
     )

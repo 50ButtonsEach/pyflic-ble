@@ -198,8 +198,10 @@ def test_flic2_no_free_connection_slots() -> None:
             Flic2ProtocolHandler(),
             2,
             [
-                lambda tmp_id: bytes([0x00, OPCODE_NO_LOGICAL_CONNECTION_SLOTS])
-                + struct.pack("<II", tmp_id ^ 1, tmp_id)
+                lambda tmp_id: (
+                    bytes([0x00, OPCODE_NO_LOGICAL_CONNECTION_SLOTS])
+                    + struct.pack("<II", tmp_id ^ 1, tmp_id)
+                )
             ],
         )
 

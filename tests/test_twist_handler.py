@@ -65,7 +65,9 @@ def _new_min(packet: bytes) -> int:
     return int.from_bytes(packet[2:8], byteorder="little", signed=True)
 
 
-def _twist_packet(mode_index: int, delta: int, *, update_too_old: bool = False) -> bytes:
+def _twist_packet(
+    mode_index: int, delta: int, *, update_too_old: bool = False
+) -> bytes:
     """Build a TwistEventNotification for a one-direction twist."""
     flags = mode_index | (0x20 if update_too_old else 0)
     return (

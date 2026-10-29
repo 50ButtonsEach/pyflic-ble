@@ -64,7 +64,9 @@ def test_failed_connection_attempt_logs_only_debug(
         asyncio.run(client.start())
 
     assert [
-        record.getMessage() for record in caplog.records if record.levelno > logging.DEBUG
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno > logging.DEBUG
     ] == []
 
 
