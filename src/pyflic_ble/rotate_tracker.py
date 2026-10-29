@@ -307,6 +307,12 @@ class MultiModeRotateTracker:
             return self._positions[mode_index]
         return 0
 
+    def get_mode_min(self, mode_index: int) -> int:
+        """Get min boundary for a mode."""
+        if 0 <= mode_index < 13:
+            return self._mins[mode_index]
+        return 0
+
     def set_mode_min(self, mode_index: int, new_min: int) -> None:
         """Set min boundary for a mode."""
         if 0 <= mode_index < 13:

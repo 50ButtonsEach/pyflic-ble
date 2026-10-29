@@ -185,6 +185,7 @@ class FlicClient:
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._background_writes: set[asyncio.Task[None]] = set()
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -1129,6 +1130,11 @@ class FlicClient:
             self._handler.handle_notification(bytes(data))
         )
 
+        if isinstance(self._handler, TwistProtocolHandler):
+            for request in self._handler.pop_position_resends():
+                _LOGGER.debug("Resending a Twist position update the device dropped")
+                self._write_in_background(request)
+
         # Emit events
         self._emit_button_events(button_events)
         self._emit_rotate_events(rotate_events)
@@ -1161,6 +1167,18 @@ class FlicClient:
                 return
             _LOGGER.debug("Putting Twist response opcode=0x%02x in queue", opcode)
             self._response_queue.put_nowait(bytes(data))
+
+    def _write_in_background(self, data: bytes) -> None:
+        """Write a packet without waiting for it, from a notification callback."""
+        task = asyncio.get_running_loop().create_task(self._write_packet(data))
+        self._background_writes.add(task)
+        task.add_done_callback(self._background_write_done)
+
+    def _background_write_done(self, task: asyncio.Task[None]) -> None:
+        """Forget a finished background write and log why it failed."""
+        self._background_writes.discard(task)
+        if not task.cancelled() and (err := task.exception()) is not None:
+            _LOGGER.debug("Background write to %s failed: %s", self.address, err)
 
     def _emit_button_events(self, button_events: list) -> None:
         """Process and emit button events."""

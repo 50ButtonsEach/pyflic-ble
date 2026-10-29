@@ -2,8 +2,10 @@
 
 import asyncio
 import struct
+from unittest.mock import AsyncMock
 
 from pyflic_ble import DeviceType, FlicClient
+from pyflic_ble.client import SessionState
 from pyflic_ble.const import (
     EVENT_TYPE_TWIST_INCREMENT,
     TWIST_OPCODE_TWIST_EVENT,
@@ -63,16 +65,21 @@ def _new_min(packet: bytes) -> int:
     return int.from_bytes(packet[2:8], byteorder="little", signed=True)
 
 
-def _twist(handler: TwistProtocolHandler, mode_index: int, delta: int) -> list[str]:
-    """Feed a one-direction twist to the handler and return the event types."""
-    packet = (
-        bytes([TWIST_OPCODE_TWIST_EVENT, mode_index])
+def _twist_packet(mode_index: int, delta: int, *, update_too_old: bool = False) -> bytes:
+    """Build a TwistEventNotification for a one-direction twist."""
+    flags = mode_index | (0x20 if update_too_old else 0)
+    return (
+        bytes([TWIST_OPCODE_TWIST_EVENT, flags])
         + (delta & 0xFFFFFF).to_bytes(3, byteorder="little")
         + (max(delta, 0) & 0xFFFFFF).to_bytes(3, byteorder="little")
         + (min(delta, 0) & 0xFFFFFF).to_bytes(3, byteorder="little")
         + bytes(2)
     )
-    _, rotate_events, _ = handler.handle_notification(packet)
+
+
+def _twist(handler: TwistProtocolHandler, mode_index: int, delta: int) -> list[str]:
+    """Feed a one-direction twist to the handler and return the event types."""
+    _, rotate_events, _ = handler.handle_notification(_twist_packet(mode_index, delta))
     return [event.event_type for event in rotate_events]
 
 
@@ -142,3 +149,39 @@ def test_position_write_rounds_to_nearest_unit() -> None:
 
     transport = _connect(client._handler)
     assert _init_positions(transport.packets[0])[0] == round(D360 * 0.55)
+
+
+def test_dropped_position_update_is_resent_with_current_min() -> None:
+    """Test the handler resends the current min when the device dropped an update."""
+    handler = TwistProtocolHandler(PushTwistMode.DEFAULT)
+    _connect(handler)
+    handler.build_update_twist_position(0, D360 // 2)
+
+    handler.handle_notification(_twist_packet(0, 100, update_too_old=True))
+    handler.handle_notification(_twist_packet(0, 100, update_too_old=True))
+
+    resends = handler.pop_position_resends()
+    assert len(resends) == 1
+    assert _new_min(resends[0]) == -(D360 // 2)
+    assert struct.unpack_from("<I", resends[0], 8)[0] == 2
+    assert handler.pop_position_resends() == []
+
+
+def test_client_writes_dropped_position_update_again() -> None:
+    """Test the client sends the resend when a twist notification flags a drop."""
+
+    async def run() -> AsyncMock:
+        client = FlicClient("AA:BB:CC:DD:EE:FF", device_type=DeviceType.TWIST)
+        client._state = SessionState.SESSION_ESTABLISHED
+        client._write_packet = AsyncMock()
+
+        # Session packets end in a 5-byte MAC that the client strips
+        client._handle_unframed_notification(
+            bytearray(_twist_packet(0, 100, update_too_old=True) + bytes(5))
+        )
+        await asyncio.sleep(0)
+        return client._write_packet
+
+    write_packet = asyncio.run(run())
+    write_packet.assert_awaited_once()
+    assert _new_min(write_packet.await_args.args[0]) == 0

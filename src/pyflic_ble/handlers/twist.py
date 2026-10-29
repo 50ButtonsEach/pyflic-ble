@@ -122,6 +122,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
         self._prev_int_pct: dict[int, int] = {}
+        self._position_resends: dict[int, bytes] = {}
 
     @property
     def service_uuid(self) -> str:
@@ -166,6 +167,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._last_event_count = 0
         self._last_boot_id = 0
         self._prev_int_pct = {}
+        self._position_resends = {}
 
     async def full_verify_pairing(
         self,
@@ -699,6 +701,12 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             self._multi_mode_tracker.get_mode_percentage(mode_index)
         )
 
+    def pop_position_resends(self) -> list[bytes]:
+        """Return the position updates to send again because the device dropped one."""
+        resends = list(self._position_resends.values())
+        self._position_resends = {}
+        return resends
+
     def set_position_for_next_init(self, mode_index: int, position: int) -> None:
         """Store a position to hand to the device with the next InitButtonEvents."""
         self._multi_mode_tracker.rebase(mode_index, position)
@@ -880,6 +888,19 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             notification.max_delta,
             notification.last_min_update_was_top,
         )
+
+        # The device drops a position update whose packet count is too far
+        # behind; send the current min again so both sides converge, like the hub
+        if notification.last_hub_update_packet_too_old:
+            self._position_resends[notification.twist_mode_index] = (
+                UpdateTwistPositionRequest(
+                    twist_mode_index=notification.twist_mode_index,
+                    new_min=self._multi_mode_tracker.get_mode_min(
+                        notification.twist_mode_index
+                    ),
+                    num_received_update_packets=self._twist_packet_counter,
+                ).to_bytes()
+            )
 
         # Get mode percentage for slot entity updates
         mode_percentage = self._multi_mode_tracker.get_mode_percentage(
