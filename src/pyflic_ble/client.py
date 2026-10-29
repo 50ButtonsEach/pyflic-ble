@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 import contextlib
 from dataclasses import dataclass
 from enum import IntEnum
@@ -30,7 +30,10 @@ from .const import (
     FRAME_HEADER_CONN_ID_MASK,
     FRAME_HEADER_FRAGMENT_FLAG,
     FRAME_HEADER_NEWLY_ASSIGNED,
+    OPCODE_DISCONNECT_VERIFIED_LINK,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
+    OPCODE_PING_REQUEST,
+    OPCODE_PING_RESPONSE,
     TWIST_DISCONNECT_REASON_INVALID_SIGNATURE,
     TWIST_DISCONNECT_REASON_OTHER_CLIENT,
     TWIST_OPCODE_BUTTON_EVENT,
@@ -39,6 +42,12 @@ from .const import (
     TWIST_OPCODE_TWIST_EVENT,
     DeviceType,
     PushTwistMode,
+)
+from .exceptions import (
+    FlicAuthenticationError,
+    FlicFirmwareUpdateError,
+    FlicPairingError,
+    FlicProtocolError,
 )
 from .security import chaskey_with_dir_and_counter
 from .handlers import (
@@ -62,22 +71,6 @@ class SessionState(IntEnum):
     WAIT_QUICK_VERIFY = 4
     SESSION_ESTABLISHED = 5
     FAILED = 6
-
-
-class FlicProtocolError(Exception):
-    """Flic protocol error."""
-
-
-class FlicPairingError(Exception):
-    """Flic pairing error."""
-
-
-class FlicAuthenticationError(Exception):
-    """Flic authentication error."""
-
-
-class FlicFirmwareUpdateError(Exception):
-    """Flic firmware update error."""
 
 
 @dataclass
@@ -185,6 +178,7 @@ class FlicClient:
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
         self._reconnect_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -267,7 +261,7 @@ class FlicClient:
         self._expecting_fragment = False
 
         try:
-            _LOGGER.info("Connecting to Flic button at %s", self.address)
+            _LOGGER.debug("Connecting to Flic button at %s", self.address)
             await close_stale_connections_by_address(self.address)
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -276,7 +270,7 @@ class FlicClient:
                 disconnected_callback=self._handle_disconnected,
                 max_attempts=1,
             )
-            _LOGGER.info("BLE connection established to %s", self.address)
+            _LOGGER.debug("BLE connection established to %s", self.address)
 
             # Abort if a firmware update started while we were connecting.
             # The transfer uses the old BleakClient; replacing it would
@@ -342,7 +336,8 @@ class FlicClient:
 
         except (TimeoutError, BleakError) as err:
             self._state = SessionState.FAILED
-            _LOGGER.error("Failed to connect to %s: %s", self.address, err)
+            # Expected while the button is out of range; the reconnect loop retries
+            _LOGGER.debug("Failed to connect to %s: %s", self.address, err)
             raise FlicProtocolError(f"Failed to connect: {err}") from err
 
     async def disconnect(self) -> None:
@@ -442,6 +437,9 @@ class FlicClient:
             self._state = SessionState.FAILED
             _LOGGER.error("Pairing timeout")
             raise FlicPairingError("Pairing timeout") from err
+        except (FlicAuthenticationError, FlicPairingError, FlicProtocolError):
+            self._state = SessionState.FAILED
+            raise
         else:
             return (
                 pairing_id,
@@ -653,9 +651,13 @@ class FlicClient:
             self._notify_state_callbacks()
             _LOGGER.info("Successfully started session with %s", self.address)
 
-        except (TimeoutError, BleakError, FlicProtocolError) as err:
+        except Exception as err:
             self._flic_state.connected = False
-            _LOGGER.error("Failed to start session with %s: %s", self.address, err)
+            _LOGGER.debug("Failed to start session with %s: %s", self.address, err)
+            # A link left up makes the next attempt return early as already
+            # connected, which also ends the reconnect loop
+            if self.is_connected:
+                await self.disconnect()
             raise
         finally:
             self._starting = False
@@ -755,16 +757,27 @@ class FlicClient:
     async def async_send_update_twist_position(
         self, mode_index: int, percentage: float
     ) -> None:
-        """Send position update via UpdateTwistPositionRequest."""
+        """Send position update via UpdateTwistPositionRequest.
+
+        Without a session, the position is kept and handed to the device with the
+        next InitButtonEvents, which is how the device gets positions anyway.
+        """
         if not isinstance(self._handler, TwistProtocolHandler):
             raise FlicProtocolError("Not a Twist device")
-        if self._state != SessionState.SESSION_ESTABLISHED:
-            raise FlicProtocolError("Session not established")
 
         # Convert percentage to raw units (D360 = 49152 = 100%)
         from .rotate_tracker import D360  # noqa: PLC0415
 
-        new_position_units = int(percentage / 100.0 * D360)
+        new_position_units = round(percentage / 100.0 * D360)
+
+        if self._state != SessionState.SESSION_ESTABLISHED:
+            self._handler.set_position_for_next_init(mode_index, new_position_units)
+            _LOGGER.debug(
+                "No session, keeping position for the next init: mode=%d, units=%d",
+                mode_index,
+                new_position_units,
+            )
+            return
 
         request_bytes = self._handler.build_update_twist_position(
             mode_index, new_position_units
@@ -1048,6 +1061,33 @@ class FlicClient:
 
             # MAC verification is disabled for reliability (matches official SDK behavior)
 
+            if opcode == OPCODE_PING_REQUEST:
+                # The button ends the session when its pings go unanswered
+                self._run_in_background(
+                    self._write_packet(
+                        bytes(
+                            [
+                                self._connection_id & FRAME_HEADER_CONN_ID_MASK,
+                                OPCODE_PING_RESPONSE,
+                            ]
+                        )
+                    )
+                )
+                return
+
+            if opcode == OPCODE_DISCONNECT_VERIFIED_LINK:
+                _LOGGER.warning(
+                    "%s ended the verified session: reason=%d",
+                    self.address,
+                    data[2] if len(data) > 2 else -1,
+                )
+                self._state = SessionState.DISCONNECTED
+                # Dropping the link runs the normal disconnect handling, which
+                # marks the button unavailable and reconnects
+                if self._client is not None:
+                    self._run_in_background(self._client.disconnect())
+                return
+
         # Delegate to handler for event processing
         button_events, rotate_events, _selector_index = (
             self._handler.handle_notification(bytes(data))
@@ -1056,6 +1096,9 @@ class FlicClient:
         # Emit events
         self._emit_button_events(button_events)
         self._emit_rotate_events(rotate_events)
+
+        for request in self._handler.pop_pending_writes():
+            self._run_in_background(self._write_packet(request))
 
         # If no events, this might be a command response
         if not button_events and not rotate_events:
@@ -1111,6 +1154,10 @@ class FlicClient:
                 reason,
             )
             self._state = SessionState.DISCONNECTED
+            # Without a session the link is useless; dropping it runs the normal
+            # disconnect handling, which marks the button unavailable and reconnects
+            if self._client is not None:
+                self._run_in_background(self._client.disconnect())
             return
 
         # Delegate to handler
@@ -1121,6 +1168,9 @@ class FlicClient:
         # Emit events
         self._emit_button_events(button_events)
         self._emit_rotate_events(rotate_events)
+
+        for request in self._handler.pop_pending_writes():
+            self._run_in_background(self._write_packet(request))
 
         # Emit selector change (Twist only)
         if selector_index is not None and self.on_selector_change:
@@ -1150,6 +1200,18 @@ class FlicClient:
                 return
             _LOGGER.debug("Putting Twist response opcode=0x%02x in queue", opcode)
             self._response_queue.put_nowait(bytes(data))
+
+    def _run_in_background(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Run a coroutine without waiting for it, from a notification callback."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+
+    def _background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Forget a finished background task and log why it failed."""
+        self._background_tasks.discard(task)
+        if not task.cancelled() and (err := task.exception()) is not None:
+            _LOGGER.debug("Background task for %s failed: %s", self.address, err)
 
     def _emit_button_events(self, button_events: list) -> None:
         """Process and emit button events."""

@@ -54,6 +54,11 @@ FLIC_MTU: Final = 140  # Maximum ATT MTU
 FLIC_MAX_PACKET_SIZE: Final = 129  # Maximum packet size (140 - 11 ATT overhead)
 FLIC_SIGNATURE_SIZE: Final = 5  # Chaskey-LTS MAC size for packets
 
+# When the button's boot id is not known yet, as after a restart, it re-sends all
+# events it holds, including ones already processed; queued events older than
+# this at connect are dropped
+UNSYNCED_QUEUED_EVENT_MAX_AGE_MS: Final = 15_000
+
 # Frame header bitmasks (Flic 2/Duo framing)
 FRAME_HEADER_CONN_ID_MASK: Final = 0x1F
 FRAME_HEADER_NEWLY_ASSIGNED: Final = 0x20
@@ -110,14 +115,27 @@ OPCODE_QUICK_VERIFY_REQUEST: Final = 5
 OPCODE_GET_FIRMWARE_VERSION_REQUEST: Final = 8
 OPCODE_GET_BATTERY_LEVEL_REQUEST: Final = 20
 OPCODE_INIT_BUTTON_EVENTS_REQUEST: Final = 23
+OPCODE_PING_RESPONSE: Final = 14
+OPCODE_ACK_BUTTON_EVENTS: Final = 16
 
 # Response opcodes (OpcodeFromFlic)
 OPCODE_FULL_VERIFY_RESPONSE_1: Final = 0
 OPCODE_FULL_VERIFY_RESPONSE_2: Final = 1
+OPCODE_NO_LOGICAL_CONNECTION_SLOTS: Final = 2
+OPCODE_FULL_VERIFY_FAIL_RESPONSE: Final = 3
 OPCODE_GET_FIRMWARE_VERSION_RESPONSE: Final = 5
 OPCODE_QUICK_VERIFY_RESPONSE: Final = 8
+OPCODE_DISCONNECT_VERIFIED_LINK: Final = 9
 OPCODE_BUTTON_EVENT: Final = 12
+OPCODE_PING_REQUEST: Final = 15
 OPCODE_GET_BATTERY_LEVEL_RESPONSE: Final = 20
+
+# Flic 2/Duo auto disconnect time in seconds (9 bits); 511 means never
+AUTO_DISCONNECT_TIME_NEVER: Final = 511
+
+# FullVerifyFailResponse reasons (Flic 2, Duo and Twist)
+FULL_VERIFY_FAIL_REASON_INVALID_VERIFIER: Final = 0
+FULL_VERIFY_FAIL_REASON_NOT_IN_PUBLIC_MODE: Final = 1
 
 # Button event types for Flic 2
 FLIC2_EVENT_UP: Final = 0
@@ -138,6 +156,7 @@ OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID: Final = 11
 
 # Flic Duo specific opcodes
 OPCODE_INIT_BUTTON_EVENTS_DUO_REQUEST: Final = 35
+OPCODE_ACK_BUTTON_EVENTS_DUO: Final = 36
 OPCODE_BUTTON_EVENT_DUO: Final = 32
 OPCODE_ENABLE_PUSH_TWIST_IND: Final = 37
 OPCODE_PUSH_TWIST_DATA_NOTIFICATION: Final = 33

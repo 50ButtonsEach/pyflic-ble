@@ -10,18 +10,22 @@ import struct
 import time
 
 from ..const import (
+    AUTO_DISCONNECT_TIME_NEVER,
     COMMAND_TIMEOUT,
     FIRMWARE_FINAL_ACK_TIMEOUT,
     FIRMWARE_UPDATE_TIMEOUT,
     FLIC2_ED25519_PUBLIC_KEY,
+    FLIC2_EVENT_SINGLE_CLICK_TIMEOUT,
     FLIC2_FIRMWARE_IV_SIZE,
     FLIC2_FIRMWARE_MAX_IN_FLIGHT_WORDS,
     FLIC2_FIRMWARE_WORD_CHUNK_SIZE,
     FLIC_NOTIFY_CHAR_UUID,
     FLIC_SERVICE_UUID,
     FLIC_WRITE_CHAR_UUID,
+    OPCODE_ACK_BUTTON_EVENTS,
     OPCODE_BUTTON_EVENT,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
+    OPCODE_FULL_VERIFY_FAIL_RESPONSE,
     OPCODE_FULL_VERIFY_REQUEST_1,
     OPCODE_FULL_VERIFY_REQUEST_2,
     OPCODE_FULL_VERIFY_RESPONSE_1,
@@ -36,12 +40,14 @@ from ..const import (
     OPCODE_INIT_BUTTON_EVENTS_REQUEST,
     OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
     OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID,
+    OPCODE_NO_LOGICAL_CONNECTION_SLOTS,
     OPCODE_QUICK_VERIFY_REQUEST,
     OPCODE_QUICK_VERIFY_RESPONSE,
     OPCODE_SET_NAME_REQUEST,
     OPCODE_SET_NAME_RESPONSE,
     OPCODE_START_FIRMWARE_UPDATE_RESPONSE,
     PAIRING_TIMEOUT,
+    UNSYNCED_QUEUED_EVENT_MAX_AGE_MS,
 )
 from ..protocol import (
     FirmwareUpdateNotification,
@@ -63,14 +69,26 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
+from ..exceptions import FlicAuthenticationError, FlicProtocolError
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
+    raise_full_verify_failure,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _needs_ack(event_encoded: int) -> bool:
+    """Return if the spec requires acknowledging a button event.
+
+    That is a button up with a single or double click, or a single click timeout.
+    """
+    if event_encoded & 0x08:
+        return bool(event_encoded & 0x02)
+    return event_encoded & 0x03 == FLIC2_EVENT_SINGLE_CLICK_TIMEOUT
 
 
 class Flic2ProtocolHandler(DeviceProtocolHandler):
@@ -87,6 +105,18 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
     def __init__(self) -> None:
         """Initialize the Flic 2 handler."""
         super().__init__()
+        # Kept across reconnects so the button only replays events we have not
+        # processed yet
+        self._event_count: int = 0
+        self._boot_id: int = 0
+        # Set when the button's boot id was not known at the last init
+        self._queued_event_cutoff_ms: int | None = None
+        self._pending_writes: list[bytes] = []
+
+    def pop_pending_writes(self) -> list[bytes]:
+        """Return the acknowledgements to send for handled button events."""
+        writes, self._pending_writes = self._pending_writes, []
+        return writes
 
     @property
     def service_uuid(self) -> str:
@@ -144,27 +174,39 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         _LOGGER.debug("FullVerifyRequest1 sent, waiting for FullVerifyResponse1")
 
         # Wait for FullVerifyResponse1
-        response1 = await asyncio.wait_for(
-            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_1),
-            timeout=PAIRING_TIMEOUT,
-        )
+        expected_len = 1 + 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 118 bytes
+        async with asyncio.timeout(PAIRING_TIMEOUT):
+            while True:
+                response1 = await self._wait_for_opcodes(
+                    [OPCODE_FULL_VERIFY_RESPONSE_1, OPCODE_NO_LOGICAL_CONNECTION_SLOTS]
+                )
+                if response1[1] == OPCODE_NO_LOGICAL_CONNECTION_SLOTS:
+                    full_tmp_ids = struct.unpack_from(
+                        f"<{(len(response1) - 2) // 4}I", response1, 2
+                    )
+                    if temp_conn_id in full_tmp_ids:
+                        raise FlicProtocolError(
+                            "The button has no free connection slots, too many "
+                            "apps are connected to it"
+                        )
+                    continue
+
+                if len(response1) < expected_len:
+                    raise FlicProtocolError(
+                        f"Invalid FullVerifyResponse1 length: {len(response1)} "
+                        f"(expected {expected_len})"
+                    )
+                received_tmp_id = struct.unpack_from("<I", response1, 2)[0]
+                if received_tmp_id == temp_conn_id:
+                    break
+                # A late response to an earlier attempt; the official libraries
+                # also ignore it and keep waiting
+                _LOGGER.debug(
+                    "Ignoring FullVerifyResponse1 for tmp_id 0x%08x", received_tmp_id
+                )
         _LOGGER.debug("Received FullVerifyResponse1 (length=%d bytes)", len(response1))
 
-        # Parse FullVerifyResponse1
-        expected_len = 1 + 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 118 bytes
-        if len(response1) < expected_len:
-            raise ValueError(
-                f"Invalid FullVerifyResponse1 length: {len(response1)} (expected {expected_len})"
-            )
-
-        offset = 2  # Skip header and opcode
-        received_tmp_id = struct.unpack("<I", response1[offset : offset + 4])[0]
-        offset += 4
-
-        if received_tmp_id != temp_conn_id:
-            raise ValueError(
-                f"tmpId mismatch: expected {temp_conn_id}, got {received_tmp_id}"
-            )
+        offset = 6  # Skip header, opcode and tmp_id
 
         signature = response1[offset : offset + 64]
         offset += 64
@@ -197,7 +239,9 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             self.ed25519_public_key, signed_data, signature
         )
         if signature_variant is None:
-            raise ValueError("Invalid button signature - all variants failed")
+            raise FlicAuthenticationError(
+                "Invalid button signature - all variants failed"
+            )
 
         _LOGGER.debug("Ed25519 signature verified with variant %d", signature_variant)
 
@@ -239,15 +283,24 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
         # Wait for FullVerifyResponse2
         response2_data = await asyncio.wait_for(
-            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_2),
+            self._wait_for_opcodes(
+                [OPCODE_FULL_VERIFY_RESPONSE_2, OPCODE_FULL_VERIFY_FAIL_RESPONSE]
+            ),
             timeout=PAIRING_TIMEOUT,
         )
         _LOGGER.debug(
             "Received FullVerifyResponse2 (length=%d bytes)", len(response2_data)
         )
 
+        if response2_data[1] == OPCODE_FULL_VERIFY_FAIL_RESPONSE:
+            reason = response2_data[2] if len(response2_data) > 2 else -1
+            raise_full_verify_failure(reason)
+
         # Parse FullVerifyResponse2
-        response2 = FullVerifyResponse2.from_bytes(response2_data)
+        try:
+            response2 = FullVerifyResponse2.from_bytes(response2_data)
+        except ValueError as err:
+            raise FlicProtocolError(str(err)) from err
         serial_number = response2.serial_number
 
         _LOGGER.debug(
@@ -336,9 +389,9 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         """Initialize button events for Flic 2."""
         request_msg = InitButtonEventsRequest(
             connection_id=self._connection_id,
-            event_count=0,
-            boot_id=0,
-            auto_disconnect_time=0,
+            event_count=self._event_count,
+            boot_id=self._boot_id,
+            auto_disconnect_time=AUTO_DISCONNECT_TIME_NEVER,
             max_queued_packets=30,
             max_queued_packets_age=60,
         )
@@ -350,6 +403,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             len(request),
         )
 
+        sent_boot_id = self._boot_id
+        self._queued_event_cutoff_ms = None
         await self._write_packet(request, True)
 
         try:
@@ -369,6 +424,22 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             )
         except TimeoutError:
             _LOGGER.warning("No response to InitButtonEventsRequest, continuing anyway")
+            return
+
+        # Header, opcode, then 1 bit has_queued_events and 47 bits timestamp, the
+        # event count, and the boot id unless it is unchanged
+        if len(response) >= 12:
+            self._event_count = struct.unpack_from("<I", response, 8)[0]
+        if (
+            response[1] == OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID
+            and len(response) >= 16
+        ):
+            self._boot_id = struct.unpack_from("<I", response, 12)[0]
+            if self._boot_id != sent_boot_id:
+                timestamp = int.from_bytes(response[2:8], byteorder="little") >> 1
+                self._queued_event_cutoff_ms = (
+                    timestamp * 1000 // 32768 - UNSYNCED_QUEUED_EVENT_MAX_AGE_MS
+                )
 
     async def set_connection_parameters(
         self,
@@ -662,6 +733,18 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             "Processing %d Flic 2 button events",
             len(notification.events),
         )
+        # The counter belongs to the last event, and all events are processed
+        self._event_count = notification.event_count
+        # One acknowledgement per notification, with the notification's counter
+        if any(_needs_ack(event.event_type) for event in notification.events):
+            self._pending_writes.append(
+                struct.pack(
+                    "<BBI",
+                    self._connection_id & 0x1F,
+                    OPCODE_ACK_BUTTON_EVENTS,
+                    notification.event_count,
+                )
+            )
 
         for idx, event in enumerate(notification.events):
             event_name = self._get_event_name(event.event_type)
@@ -675,6 +758,14 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
                 event.was_queued,
                 event.was_queued_last,
             )
+
+            if (
+                event.was_queued
+                and self._queued_event_cutoff_ms is not None
+                and event.timestamp_ms < self._queued_event_cutoff_ms
+            ):
+                _LOGGER.debug("Dropping old queued Flic 2 button event %d", idx)
+                continue
 
             ha_event = self._map_event_type(event.event_type)
             if ha_event:

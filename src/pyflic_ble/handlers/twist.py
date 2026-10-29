@@ -52,6 +52,7 @@ from ..const import (
     TWIST_RX_CHAR_UUID,
     TWIST_SERVICE_UUID,
     TWIST_TX_CHAR_UUID,
+    UNSYNCED_QUEUED_EVENT_MAX_AGE_MS,
     PushTwistMode,
 )
 from ..protocol import (
@@ -80,12 +81,14 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
-from ..rotate_tracker import D360, MultiModeRotateTracker
+from ..exceptions import FlicAuthenticationError, FlicProtocolError
+from ..rotate_tracker import MultiModeRotateTracker
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
+    raise_full_verify_failure,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,10 +116,20 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._twist_mode_index: int = 0
         self._twist_packet_counter: int = 0
         self._push_twist_mode = push_twist_mode
-        self._multi_mode_tracker: MultiModeRotateTracker | None = None
+        self._multi_mode_tracker = MultiModeRotateTracker(
+            bound_mode_12=(
+                push_twist_mode in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
+            ),
+            wrap_position=(push_twist_mode == PushTwistMode.CONTINUOUS),
+        )
+        # Kept across reconnects so the device only replays events we have not
+        # processed yet
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
+        # Set when the device's boot id was not known at the last init
+        self._queued_event_cutoff_ms: int | None = None
         self._prev_int_pct: dict[int, int] = {}
+        self._position_resends: dict[int, bytes] = {}
 
     @property
     def service_uuid(self) -> str:
@@ -158,9 +171,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         super().reset_state()
         self._twist_mode_index = 0
         self._twist_packet_counter = 0
-        self._last_event_count = 0
-        self._last_boot_id = 0
         self._prev_int_pct = {}
+        self._position_resends = {}
 
     async def full_verify_pairing(
         self,
@@ -182,30 +194,33 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         await self._write_gatt(self.write_char_uuid, request1)
         _LOGGER.debug("TwistFullVerifyRequest1 sent, waiting for response")
 
-        response1 = await asyncio.wait_for(
-            self._wait_for_opcode(TWIST_OPCODE_FULL_VERIFY_RESPONSE_1),
-            timeout=PAIRING_TIMEOUT,
-        )
+        # Parse Twist response (no frame header)
+        expected_len = 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 117 bytes
+        async with asyncio.timeout(PAIRING_TIMEOUT):
+            while True:
+                response1 = await self._wait_for_opcode(
+                    TWIST_OPCODE_FULL_VERIFY_RESPONSE_1
+                )
+                if len(response1) < expected_len:
+                    raise FlicProtocolError(
+                        f"Invalid TwistFullVerifyResponse1 length: {len(response1)} "
+                        f"(expected {expected_len})"
+                    )
+                received_tmp_id = struct.unpack_from("<I", response1, 1)[0]
+                if received_tmp_id == temp_conn_id:
+                    break
+                # A late response to an earlier attempt; the official libraries
+                # also ignore it and keep waiting
+                _LOGGER.debug(
+                    "Ignoring TwistFullVerifyResponse1 for tmp_id 0x%08x",
+                    received_tmp_id,
+                )
         _LOGGER.debug(
             "Received TwistFullVerifyResponse1 (length=%d bytes)",
             len(response1),
         )
 
-        # Parse Twist response (no frame header)
-        expected_len = 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 117 bytes
-        if len(response1) < expected_len:
-            raise ValueError(
-                f"Invalid TwistFullVerifyResponse1 length: {len(response1)} (expected {expected_len})"
-            )
-
-        offset = 1  # Skip opcode only
-        received_tmp_id = struct.unpack("<I", response1[offset : offset + 4])[0]
-        offset += 4
-
-        if received_tmp_id != temp_conn_id:
-            raise ValueError(
-                f"tmpId mismatch: expected {temp_conn_id}, got {received_tmp_id}"
-            )
+        offset = 5  # Skip opcode and tmp_id
 
         signature = response1[offset : offset + 64]
         offset += 64
@@ -229,8 +244,9 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             self.ed25519_public_key, signed_data, signature
         )
         if signature_variant is None:
-            _LOGGER.error("Ed25519 verification failed for all variants")
-            raise ValueError("Invalid Twist signature - all variants failed")
+            raise FlicAuthenticationError(
+                "Invalid Twist signature - all variants failed"
+            )
 
         _LOGGER.debug(
             "Twist Ed25519 signature verified with sigBits=%d",
@@ -288,13 +304,13 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         )
 
         if response2_data[0] == TWIST_OPCODE_FULL_VERIFY_FAIL_RESPONSE:
-            reason = response2_data[1] if len(response2_data) > 1 else 0
-            reason_str = {0: "INVALID_VERIFIER", 1: "NOT_IN_PUBLIC_MODE"}.get(
-                reason, f"UNKNOWN({reason})"
-            )
-            raise ValueError(f"Twist pairing failed: {reason_str} (code {reason})")
+            reason = response2_data[1] if len(response2_data) > 1 else -1
+            raise_full_verify_failure(reason)
 
-        response2 = TwistFullVerifyResponse2.from_bytes(response2_data)
+        try:
+            response2 = TwistFullVerifyResponse2.from_bytes(response2_data)
+        except ValueError as err:
+            raise FlicProtocolError(str(err)) from err
 
         _LOGGER.info("Twist paired (serial=%s)", response2.serial_number)
 
@@ -373,20 +389,10 @@ class TwistProtocolHandler(DeviceProtocolHandler):
     ) -> None:
         """Initialize button events for Flic Twist."""
         # The device does not persist rotation positions across a connection; the
-        # hub restores them through the position field below. Keep the existing
-        # tracker so a reconnect resumes where the dial actually is.
-        if self._multi_mode_tracker is None:
-            self._multi_mode_tracker = MultiModeRotateTracker(
-                bound_mode_12=(
-                    self._push_twist_mode
-                    in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
-                ),
-                wrap_position=(self._push_twist_mode == PushTwistMode.CONTINUOUS),
-            )
-
+        # hub restores them through the position field below. Keep the tracker
+        # across reconnects so a reconnect resumes where the dial actually is.
         positions = [
-            int(self._multi_mode_tracker.get_mode_percentage(index) / 100.0 * D360)
-            for index in range(13)
+            self._multi_mode_tracker.get_mode_units(index) for index in range(13)
         ]
 
         # Build 13 mode configs based on push_twist_mode setting
@@ -447,12 +453,20 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         )
         request = request_msg.to_bytes()
 
+        # The device re-bases every mode on this request, and rotation updates can
+        # arrive before the write returns
+        for index, position in enumerate(positions):
+            self._multi_mode_tracker.rebase(index, position)
+            self._reset_increment_baseline(index)
+
         _LOGGER.debug(
             "Sending InitButtonEventsTwistRequest (%d bytes)",
             len(request),
         )
 
         authenticated = session_key is not None and chaskey_keys is not None
+        sent_boot_id = self._last_boot_id
+        self._queued_event_cutoff_ms = None
         await self._write_packet(request, authenticated)
 
         try:
@@ -465,6 +479,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 init_response = InitButtonEventsResponseV2.from_bytes(response)
                 self._last_event_count = init_response.event_count
                 self._last_boot_id = init_response.boot_id
+                if init_response.boot_id != sent_boot_id:
+                    self._queued_event_cutoff_ms = (
+                        init_response.timestamp * 1000 // 32768
+                        - UNSYNCED_QUEUED_EVENT_MAX_AGE_MS
+                    )
                 _LOGGER.debug(
                     "Twist button events initialized: has_queued=%s, "
                     "event_count=%d, boot_id=%d, api_version=%d",
@@ -632,6 +651,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             "Processing %d Twist button events",
             len(notification.events),
         )
+        # The counter belongs to the last event, and all events are processed
+        self._last_event_count = notification.event_count
 
         for idx, event in enumerate(notification.events):
             event_name = self._get_event_name(event.event_type)
@@ -645,6 +666,14 @@ class TwistProtocolHandler(DeviceProtocolHandler):
                 event.timestamp_ms,
                 event.was_queued,
             )
+
+            if (
+                event.was_queued
+                and self._queued_event_cutoff_ms is not None
+                and event.timestamp_ms < self._queued_event_cutoff_ms
+            ):
+                _LOGGER.debug("Dropping old queued Twist button event %d", idx)
+                continue
 
             # Track mode changes (selector position)
             if event.twist_mode_index != self._twist_mode_index:
@@ -692,21 +721,33 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
         return events, selector_change
 
+    def _reset_increment_baseline(self, mode_index: int) -> None:
+        """Count increment events from the current position of a mode."""
+        self._prev_int_pct[mode_index] = round(
+            self._multi_mode_tracker.get_mode_percentage(mode_index)
+        )
+
+    def pop_pending_writes(self) -> list[bytes]:
+        """Return the position updates to send again because the device dropped one."""
+        resends = list(self._position_resends.values())
+        self._position_resends = {}
+        return resends
+
+    def set_position_for_next_init(self, mode_index: int, position: int) -> None:
+        """Store a position to hand to the device with the next InitButtonEvents."""
+        self._multi_mode_tracker.rebase(mode_index, position)
+
     def build_update_twist_position(
         self, mode_index: int, desired_position: int
     ) -> bytes:
         """Build an UpdateTwistPositionRequest."""
-        absolute_position = 0
-        if self._multi_mode_tracker is not None:
-            absolute_position = self._multi_mode_tracker.get_absolute_position(
-                mode_index
-            )
+        absolute_position = self._multi_mode_tracker.get_absolute_position(mode_index)
 
         new_min = absolute_position - desired_position
 
-        if self._multi_mode_tracker is not None:
-            # Update local min to match what the device will have
-            self._multi_mode_tracker.set_mode_min(mode_index, new_min)
+        # Update local min to match what the device will have
+        self._multi_mode_tracker.set_mode_min(mode_index, new_min)
+        self._reset_increment_baseline(mode_index)
 
         request = UpdateTwistPositionRequest(
             twist_mode_index=mode_index,
@@ -844,12 +885,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         """Parse Twist rotation event."""
         events: list[RotateEvent] = []
 
-        if self._multi_mode_tracker is None:
-            _LOGGER.warning(
-                "Twist rotation event received but rotate tracker not initialized"
-            )
-            return events
-
         try:
             notification = TwistEventNotification.from_bytes(event_data)
         except ValueError as err:
@@ -879,6 +914,20 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             notification.max_delta,
             notification.last_min_update_was_top,
         )
+
+        # The device drops a position update whose packet count is too far
+        # behind; send the current min again so both sides converge, like the hub
+        if notification.last_hub_update_packet_too_old:
+            _LOGGER.debug("Resending a Twist position update the device dropped")
+            self._position_resends[notification.twist_mode_index] = (
+                UpdateTwistPositionRequest(
+                    twist_mode_index=notification.twist_mode_index,
+                    new_min=self._multi_mode_tracker.get_mode_min(
+                        notification.twist_mode_index
+                    ),
+                    num_received_update_packets=self._twist_packet_counter,
+                ).to_bytes()
+            )
 
         # Get mode percentage for slot entity updates
         mode_percentage = self._multi_mode_tracker.get_mode_percentage(
@@ -959,7 +1008,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         produces 3 events. Uses shorter path around wrap in CONTINUOUS mode.
         """
         events: list[RotateEvent] = []
-        int_pct = int(mode_percentage)
+        int_pct = round(mode_percentage)
 
         prev_pct = self._prev_int_pct.get(twist_mode_index)
         self._prev_int_pct[twist_mode_index] = int_pct

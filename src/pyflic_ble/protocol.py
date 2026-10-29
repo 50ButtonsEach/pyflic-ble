@@ -13,6 +13,7 @@ import struct
 from typing import TYPE_CHECKING
 
 from .const import (
+    AUTO_DISCONNECT_TIME_NEVER,
     DUO_FIRMWARE_STATUS_INTERVAL,
     FIRMWARE_HEADER_SIZE,
     FIRMWARE_STATUS_INTERVAL,
@@ -150,7 +151,7 @@ class InitButtonEventsRequest:
     connection_id: int
     event_count: int = 0  # 0 = all new events
     boot_id: int = 0  # 0 = ignore boot id
-    auto_disconnect_time: int = 0  # 0 = no auto-disconnect (9 bits)
+    auto_disconnect_time: int = AUTO_DISCONNECT_TIME_NEVER  # seconds, 9 bits
     max_queued_packets: int = 30  # max 31 (5 bits)
     max_queued_packets_age: int = 60  # seconds (20 bits)
 
@@ -186,7 +187,7 @@ class InitButtonEventsDuoRequest:
     event_count_0: int = 0  # Event count for button 0
     event_count_1: int = 0  # Event count for button 1
     boot_id: int = 0
-    auto_disconnect_time: int = 0
+    auto_disconnect_time: int = AUTO_DISCONNECT_TIME_NEVER  # seconds, 9 bits
     max_queued_packets: int = 30
     max_queued_packets_age: int = 60
 
@@ -895,10 +896,13 @@ def _parse_duo_events_from_bytes(
                 had_parse_error = True
                 break
 
-            # Set ACK flag for single and double clicks
+            # The spec acknowledges single clicks (types 1 and 2), double clicks
+            # (types 3 and 4) and single click timeouts (type 6)
             if event_type in (
                 ButtonEventType.UP_SINGLE_CLICK,
+                ButtonEventType.UP_AFTER_HOLD,
                 ButtonEventType.UP_DOUBLE_CLICK,
+                ButtonEventType.UP_WITH_FLAG,
                 ButtonEventType.SINGLE_CLICK_TIMEOUT,
             ):
                 send_ack = True

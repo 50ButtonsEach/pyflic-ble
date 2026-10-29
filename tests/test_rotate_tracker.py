@@ -59,6 +59,21 @@ def test_multi_mode_tracker_mode_12_bounded_reverse() -> None:
     assert pct == 0.0
 
 
+def test_multi_mode_tracker_rebase() -> None:
+    """Test rebase restarts a mode at the given position with a zero min."""
+    tracker = MultiModeRotateTracker(bound_mode_12=True)
+    tracker.apply(0, D360 // 4)
+    tracker.set_mode_min(0, -D360 // 2)
+    assert tracker.get_mode_percentage(0) == 75.0
+
+    tracker.rebase(0, D360 // 2)
+    assert tracker.get_absolute_position(0) == D360 // 2
+    assert tracker.get_mode_percentage(0) == 50.0
+
+    tracker.apply(0, D360 // 4)
+    assert tracker.get_mode_percentage(0) == 75.0
+
+
 def test_multi_mode_tracker_slot_modes_always_bounded() -> None:
     """Test slot modes (0-11) are always bounded regardless of bound_mode_12."""
     for bound_mode_12 in (True, False):
