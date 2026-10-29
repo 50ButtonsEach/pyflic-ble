@@ -121,6 +121,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             ),
             wrap_position=(push_twist_mode == PushTwistMode.CONTINUOUS),
         )
+        # Kept across reconnects so the device only replays events we have not
+        # processed yet
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
         self._prev_int_pct: dict[int, int] = {}
@@ -166,8 +168,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         super().reset_state()
         self._twist_mode_index = 0
         self._twist_packet_counter = 0
-        self._last_event_count = 0
-        self._last_boot_id = 0
         self._prev_int_pct = {}
         self._position_resends = {}
 
@@ -641,6 +641,8 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             "Processing %d Twist button events",
             len(notification.events),
         )
+        # The counter belongs to the last event, and all events are processed
+        self._last_event_count = notification.event_count
 
         for idx, event in enumerate(notification.events):
             event_name = self._get_event_name(event.event_type)

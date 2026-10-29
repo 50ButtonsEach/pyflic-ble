@@ -91,6 +91,10 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
     def __init__(self) -> None:
         """Initialize the Flic 2 handler."""
         super().__init__()
+        # Kept across reconnects so the button only replays events we have not
+        # processed yet
+        self._event_count: int = 0
+        self._boot_id: int = 0
 
     @property
     def service_uuid(self) -> str:
@@ -363,8 +367,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         """Initialize button events for Flic 2."""
         request_msg = InitButtonEventsRequest(
             connection_id=self._connection_id,
-            event_count=0,
-            boot_id=0,
+            event_count=self._event_count,
+            boot_id=self._boot_id,
             auto_disconnect_time=0,
             max_queued_packets=30,
             max_queued_packets_age=60,
@@ -396,6 +400,17 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             )
         except TimeoutError:
             _LOGGER.warning("No response to InitButtonEventsRequest, continuing anyway")
+            return
+
+        # Header, opcode, then 1 bit has_queued_events and 47 bits timestamp, the
+        # event count, and the boot id unless it is unchanged
+        if len(response) >= 12:
+            self._event_count = struct.unpack_from("<I", response, 8)[0]
+        if (
+            response[1] == OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID
+            and len(response) >= 16
+        ):
+            self._boot_id = struct.unpack_from("<I", response, 12)[0]
 
     async def set_connection_parameters(
         self,
@@ -689,6 +704,8 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             "Processing %d Flic 2 button events",
             len(notification.events),
         )
+        # The counter belongs to the last event, and all events are processed
+        self._event_count = notification.event_count
 
         for idx, event in enumerate(notification.events):
             event_name = self._get_event_name(event.event_type)
