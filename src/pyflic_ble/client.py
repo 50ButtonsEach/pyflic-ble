@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 import contextlib
 from dataclasses import dataclass
 from enum import IntEnum
@@ -175,7 +175,7 @@ class FlicClient:
         self._reconnect_lock = asyncio.Lock()
         self._reconnect_event = asyncio.Event()
         self._reconnect_task: asyncio.Task[None] | None = None
-        self._background_writes: set[asyncio.Task[None]] = set()
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._flic_state = FlicState(
             connected=False,
             battery_voltage=None,
@@ -648,9 +648,13 @@ class FlicClient:
             self._notify_state_callbacks()
             _LOGGER.info("Successfully started session with %s", self.address)
 
-        except (TimeoutError, BleakError, FlicProtocolError) as err:
+        except Exception as err:
             self._flic_state.connected = False
             _LOGGER.debug("Failed to start session with %s: %s", self.address, err)
+            # A link left up makes the next attempt return early as already
+            # connected, which also ends the reconnect loop
+            if self.is_connected:
+                await self.disconnect()
             raise
         finally:
             self._starting = False
@@ -1117,6 +1121,10 @@ class FlicClient:
                 reason,
             )
             self._state = SessionState.DISCONNECTED
+            # Without a session the link is useless; dropping it runs the normal
+            # disconnect handling, which marks the button unavailable and reconnects
+            if self._client is not None:
+                self._run_in_background(self._client.disconnect())
             return
 
         # Delegate to handler
@@ -1127,7 +1135,7 @@ class FlicClient:
         if isinstance(self._handler, TwistProtocolHandler):
             for request in self._handler.pop_position_resends():
                 _LOGGER.debug("Resending a Twist position update the device dropped")
-                self._write_in_background(request)
+                self._run_in_background(self._write_packet(request))
 
         # Emit events
         self._emit_button_events(button_events)
@@ -1162,17 +1170,17 @@ class FlicClient:
             _LOGGER.debug("Putting Twist response opcode=0x%02x in queue", opcode)
             self._response_queue.put_nowait(bytes(data))
 
-    def _write_in_background(self, data: bytes) -> None:
-        """Write a packet without waiting for it, from a notification callback."""
-        task = asyncio.get_running_loop().create_task(self._write_packet(data))
-        self._background_writes.add(task)
-        task.add_done_callback(self._background_write_done)
+    def _run_in_background(self, coro: Coroutine[Any, Any, Any]) -> None:
+        """Run a coroutine without waiting for it, from a notification callback."""
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
 
-    def _background_write_done(self, task: asyncio.Task[None]) -> None:
-        """Forget a finished background write and log why it failed."""
-        self._background_writes.discard(task)
+    def _background_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Forget a finished background task and log why it failed."""
+        self._background_tasks.discard(task)
         if not task.cancelled() and (err := task.exception()) is not None:
-            _LOGGER.debug("Background write to %s failed: %s", self.address, err)
+            _LOGGER.debug("Background task for %s failed: %s", self.address, err)
 
     def _emit_button_events(self, button_events: list) -> None:
         """Process and emit button events."""
