@@ -258,7 +258,7 @@ class FlicClient:
         self._expecting_fragment = False
 
         try:
-            _LOGGER.info("Connecting to Flic button at %s", self.address)
+            _LOGGER.debug("Connecting to Flic button at %s", self.address)
             await close_stale_connections_by_address(self.address)
             self._client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -267,7 +267,7 @@ class FlicClient:
                 disconnected_callback=self._handle_disconnected,
                 max_attempts=1,
             )
-            _LOGGER.info("BLE connection established to %s", self.address)
+            _LOGGER.debug("BLE connection established to %s", self.address)
 
             # Abort if a firmware update started while we were connecting.
             # The transfer uses the old BleakClient; replacing it would
@@ -333,7 +333,8 @@ class FlicClient:
 
         except (TimeoutError, BleakError) as err:
             self._state = SessionState.FAILED
-            _LOGGER.error("Failed to connect to %s: %s", self.address, err)
+            # Expected while the button is out of range; the reconnect loop retries
+            _LOGGER.debug("Failed to connect to %s: %s", self.address, err)
             raise FlicProtocolError(f"Failed to connect: {err}") from err
 
     async def disconnect(self) -> None:
@@ -649,7 +650,7 @@ class FlicClient:
 
         except (TimeoutError, BleakError, FlicProtocolError) as err:
             self._flic_state.connected = False
-            _LOGGER.error("Failed to start session with %s: %s", self.address, err)
+            _LOGGER.debug("Failed to start session with %s: %s", self.address, err)
             raise
         finally:
             self._starting = False
