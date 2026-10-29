@@ -446,6 +446,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         # arrive before the write returns
         for index, position in enumerate(positions):
             self._multi_mode_tracker.rebase(index, position)
+            self._reset_increment_baseline(index)
 
         _LOGGER.debug(
             "Sending InitButtonEventsTwistRequest (%d bytes)",
@@ -692,6 +693,12 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
         return events, selector_change
 
+    def _reset_increment_baseline(self, mode_index: int) -> None:
+        """Count increment events from the current position of a mode."""
+        self._prev_int_pct[mode_index] = round(
+            self._multi_mode_tracker.get_mode_percentage(mode_index)
+        )
+
     def set_position_for_next_init(self, mode_index: int, position: int) -> None:
         """Store a position to hand to the device with the next InitButtonEvents."""
         self._multi_mode_tracker.rebase(mode_index, position)
@@ -706,6 +713,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
         # Update local min to match what the device will have
         self._multi_mode_tracker.set_mode_min(mode_index, new_min)
+        self._reset_increment_baseline(mode_index)
 
         request = UpdateTwistPositionRequest(
             twist_mode_index=mode_index,
@@ -952,7 +960,7 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         produces 3 events. Uses shorter path around wrap in CONTINUOUS mode.
         """
         events: list[RotateEvent] = []
-        int_pct = int(mode_percentage)
+        int_pct = round(mode_percentage)
 
         prev_pct = self._prev_int_pct.get(twist_mode_index)
         self._prev_int_pct[twist_mode_index] = int_pct

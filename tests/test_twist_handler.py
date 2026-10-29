@@ -4,7 +4,11 @@ import asyncio
 import struct
 
 from pyflic_ble import DeviceType, FlicClient
-from pyflic_ble.const import PushTwistMode
+from pyflic_ble.const import (
+    EVENT_TYPE_TWIST_INCREMENT,
+    TWIST_OPCODE_TWIST_EVENT,
+    PushTwistMode,
+)
 from pyflic_ble.handlers.twist import TwistProtocolHandler
 from pyflic_ble.rotate_tracker import D360
 
@@ -59,6 +63,19 @@ def _new_min(packet: bytes) -> int:
     return int.from_bytes(packet[2:8], byteorder="little", signed=True)
 
 
+def _twist(handler: TwistProtocolHandler, mode_index: int, delta: int) -> list[str]:
+    """Feed a one-direction twist to the handler and return the event types."""
+    packet = (
+        bytes([TWIST_OPCODE_TWIST_EVENT, mode_index])
+        + (delta & 0xFFFFFF).to_bytes(3, byteorder="little")
+        + (max(delta, 0) & 0xFFFFFF).to_bytes(3, byteorder="little")
+        + (min(delta, 0) & 0xFFFFFF).to_bytes(3, byteorder="little")
+        + bytes(2)
+    )
+    _, rotate_events, _ = handler.handle_notification(packet)
+    return [event.event_type for event in rotate_events]
+
+
 def test_position_write_after_reconnect_uses_device_frame() -> None:
     """Test a position write after a reconnect lands where the device expects it."""
     handler = TwistProtocolHandler(PushTwistMode.DEFAULT)
@@ -94,3 +111,34 @@ def test_position_write_without_session_is_sent_with_next_init() -> None:
 
     transport = _connect(client._handler)
     assert _init_positions(transport.packets[0])[0] == D360 // 2
+
+
+def test_no_increment_burst_after_position_write() -> None:
+    """Test a small twist after a position write emits a single increment."""
+    handler = TwistProtocolHandler(PushTwistMode.DEFAULT)
+    _connect(handler)
+    _twist(handler, 0, D360 // 10)
+
+    handler.build_update_twist_position(0, round(D360 * 0.55))
+
+    assert _twist(handler, 0, D360 // 100 + 1) == [EVENT_TYPE_TWIST_INCREMENT]
+
+
+def test_first_twist_after_reconnect_emits_increment() -> None:
+    """Test the first 1% step after a reconnect is not swallowed."""
+    handler = TwistProtocolHandler(PushTwistMode.DEFAULT)
+    _connect(handler)
+    _twist(handler, 0, D360 // 10)
+    _connect(handler)
+
+    assert _twist(handler, 0, D360 // 100 + 1) == [EVENT_TYPE_TWIST_INCREMENT]
+
+
+def test_position_write_rounds_to_nearest_unit() -> None:
+    """Test a percentage is converted to the nearest unit instead of truncated."""
+    client = FlicClient("AA:BB:CC:DD:EE:FF", device_type=DeviceType.TWIST)
+
+    asyncio.run(client.async_send_update_twist_position(0, 55.0))
+
+    transport = _connect(client._handler)
+    assert _init_positions(transport.packets[0])[0] == round(D360 * 0.55)

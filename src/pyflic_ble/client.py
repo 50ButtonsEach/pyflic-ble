@@ -766,7 +766,7 @@ class FlicClient:
         # Convert percentage to raw units (D360 = 49152 = 100%)
         from .rotate_tracker import D360  # noqa: PLC0415
 
-        new_position_units = int(percentage / 100.0 * D360)
+        new_position_units = round(percentage / 100.0 * D360)
 
         if self._state != SessionState.SESSION_ESTABLISHED:
             self._handler.set_position_for_next_init(mode_index, new_position_units)
