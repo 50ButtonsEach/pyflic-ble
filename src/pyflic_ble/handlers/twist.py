@@ -692,6 +692,10 @@ class TwistProtocolHandler(DeviceProtocolHandler):
 
         return events, selector_change
 
+    def set_position_for_next_init(self, mode_index: int, position: int) -> None:
+        """Store a position to hand to the device with the next InitButtonEvents."""
+        self._multi_mode_tracker.rebase(mode_index, position)
+
     def build_update_twist_position(
         self, mode_index: int, desired_position: int
     ) -> bytes:

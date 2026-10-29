@@ -3,6 +3,7 @@
 import asyncio
 import struct
 
+from pyflic_ble import DeviceType, FlicClient
 from pyflic_ble.const import PushTwistMode
 from pyflic_ble.handlers.twist import TwistProtocolHandler
 from pyflic_ble.rotate_tracker import D360
@@ -83,3 +84,13 @@ def test_init_sends_exact_positions() -> None:
     transport = _connect(handler)
 
     assert _init_positions(transport.packets[0])[0] == restored
+
+
+def test_position_write_without_session_is_sent_with_next_init() -> None:
+    """Test a position write without a session reaches the device on the next init."""
+    client = FlicClient("AA:BB:CC:DD:EE:FF", device_type=DeviceType.TWIST)
+
+    asyncio.run(client.async_send_update_twist_position(0, 50.0))
+
+    transport = _connect(client._handler)
+    assert _init_positions(transport.packets[0])[0] == D360 // 2
