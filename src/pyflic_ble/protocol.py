@@ -896,10 +896,13 @@ def _parse_duo_events_from_bytes(
                 had_parse_error = True
                 break
 
-            # Set ACK flag for single and double clicks
+            # The spec acknowledges single clicks (types 1 and 2), double clicks
+            # (types 3 and 4) and single click timeouts (type 6)
             if event_type in (
                 ButtonEventType.UP_SINGLE_CLICK,
+                ButtonEventType.UP_AFTER_HOLD,
                 ButtonEventType.UP_DOUBLE_CLICK,
+                ButtonEventType.UP_WITH_FLAG,
                 ButtonEventType.SINGLE_CLICK_TIMEOUT,
             ):
                 send_ack = True

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 import logging
+import struct
 import time
 from typing import Final
 
@@ -27,12 +28,14 @@ from ..const import (
     FIRMWARE_FINAL_ACK_TIMEOUT,
     FIRMWARE_HEADER_SIZE,
     FIRMWARE_UPDATE_TIMEOUT,
+    OPCODE_ACK_BUTTON_EVENTS_DUO,
     OPCODE_BUTTON_EVENT_DUO,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
     OPCODE_INIT_BUTTON_EVENTS_DUO_REQUEST,
     OPCODE_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITH_BOOT_ID,
     OPCODE_INIT_BUTTON_EVENTS_DUO_RESPONSE_WITHOUT_BOOT_ID,
     OPCODE_PUSH_TWIST_DATA_NOTIFICATION,
+    UNSYNCED_QUEUED_EVENT_MAX_AGE_MS,
 )
 from ..protocol import (
     ButtonEventType,
@@ -84,6 +87,10 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
         """Initialize the Duo handler."""
         super().__init__()
         self._duo_parser_state: DuoParserState | None = None
+        # Kept across reconnects so the button only replays events we have not
+        # processed yet
+        self._duo_event_count: list[int] = [0, 0]
+        self._duo_boot_id: int = 0
         self._rotate_trackers: dict[int, RotateTracker] = {}
         # Rotation filtering state: suppress swipe-induced dial events
         self._button_down_time: dict[int, float] = {}
@@ -129,9 +136,9 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
         # Initialize Duo button events
         request_msg = InitButtonEventsDuoRequest(
             connection_id=self._connection_id,
-            event_count_0=0,
-            event_count_1=0,
-            boot_id=0,
+            event_count_0=self._duo_event_count[0],
+            event_count_1=self._duo_event_count[1],
+            boot_id=self._duo_boot_id,
             auto_disconnect_time=AUTO_DISCONNECT_TIME_NEVER,
             max_queued_packets=30,
             max_queued_packets_age=60,
@@ -143,6 +150,8 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             OPCODE_INIT_BUTTON_EVENTS_DUO_REQUEST,
             len(request),
         )
+        sent_boot_id = self._duo_boot_id
+        self._queued_event_cutoff_ms = None
         await self._write_packet(request, True)
 
         try:
@@ -164,9 +173,32 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             _LOGGER.warning(
                 "No response to InitButtonEventsDuoRequest, continuing anyway"
             )
+        else:
+            self._apply_init_response(response, sent_boot_id)
 
         # Enable push twist (rotation) events
         await self._init_push_twist_events()
+
+    def _apply_init_response(self, response: bytes, sent_boot_id: int) -> None:
+        """Start decoding events from the counts the button reports."""
+        # Header, opcode, 1 bit has_queued_events and 47 bits timestamp in ms, the
+        # two event counts, and the boot id unless it is unchanged. The spec's
+        # struct names for opcodes 30 and 31 are swapped, so go by the length.
+        if len(response) < 16 or self._duo_parser_state is None:
+            return
+        packed = int.from_bytes(response[2:8], byteorder="little")
+        self._duo_event_count = list(struct.unpack_from("<II", response, 8))
+        self._duo_parser_state.initialize(
+            event_counts=self._duo_event_count,
+            last_timestamp=0,
+            has_processed_end_of_queue_marker=not packed & 1,
+        )
+        if len(response) >= 20:
+            self._duo_boot_id = struct.unpack_from("<I", response, 16)[0]
+            if self._duo_boot_id != sent_boot_id:
+                self._queued_event_cutoff_ms = (
+                    (packed >> 1) - UNSYNCED_QUEUED_EVENT_MAX_AGE_MS
+                )
 
     async def _init_push_twist_events(self) -> None:
         """Initialize push twist (rotation) events for Flic Duo."""
@@ -332,6 +364,17 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             len(notification.events),
             notification.per_button_event_count,
         )
+        self._duo_event_count = notification.per_button_event_count.copy()
+        if notification.needs_ack:
+            # The Duo acknowledgement carries the counts of both buttons
+            self._pending_writes.append(
+                struct.pack(
+                    "<BBII",
+                    self._connection_id & 0x1F,
+                    OPCODE_ACK_BUTTON_EVENTS_DUO,
+                    *self._duo_event_count,
+                )
+            )
 
         for idx, event in enumerate(notification.events):
             _LOGGER.debug(
@@ -344,6 +387,14 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
                 event.was_queued,
                 event.gesture,
             )
+
+            if (
+                event.was_queued
+                and self._queued_event_cutoff_ms is not None
+                and event.timestamp_ms < self._queued_event_cutoff_ms
+            ):
+                _LOGGER.debug("Dropping old queued Flic Duo button event %d", idx)
+                continue
 
             # Track button press/release for rotation gating
             btn = event.button_index
