@@ -40,6 +40,12 @@ from .const import (
     DeviceType,
     PushTwistMode,
 )
+from .exceptions import (
+    FlicAuthenticationError,
+    FlicFirmwareUpdateError,
+    FlicPairingError,
+    FlicProtocolError,
+)
 from .security import chaskey_with_dir_and_counter
 from .handlers import (
     DeviceCapabilities,
@@ -62,22 +68,6 @@ class SessionState(IntEnum):
     WAIT_QUICK_VERIFY = 4
     SESSION_ESTABLISHED = 5
     FAILED = 6
-
-
-class FlicProtocolError(Exception):
-    """Flic protocol error."""
-
-
-class FlicPairingError(Exception):
-    """Flic pairing error."""
-
-
-class FlicAuthenticationError(Exception):
-    """Flic authentication error."""
-
-
-class FlicFirmwareUpdateError(Exception):
-    """Flic firmware update error."""
 
 
 @dataclass
@@ -443,6 +433,9 @@ class FlicClient:
             self._state = SessionState.FAILED
             _LOGGER.error("Pairing timeout")
             raise FlicPairingError("Pairing timeout") from err
+        except (FlicAuthenticationError, FlicPairingError, FlicProtocolError):
+            self._state = SessionState.FAILED
+            raise
         else:
             return (
                 pairing_id,

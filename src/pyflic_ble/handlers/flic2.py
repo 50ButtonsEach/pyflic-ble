@@ -22,6 +22,7 @@ from ..const import (
     FLIC_WRITE_CHAR_UUID,
     OPCODE_BUTTON_EVENT,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
+    OPCODE_FULL_VERIFY_FAIL_RESPONSE,
     OPCODE_FULL_VERIFY_REQUEST_1,
     OPCODE_FULL_VERIFY_REQUEST_2,
     OPCODE_FULL_VERIFY_RESPONSE_1,
@@ -36,6 +37,7 @@ from ..const import (
     OPCODE_INIT_BUTTON_EVENTS_REQUEST,
     OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITH_BOOT_ID,
     OPCODE_INIT_BUTTON_EVENTS_RESPONSE_WITHOUT_BOOT_ID,
+    OPCODE_NO_LOGICAL_CONNECTION_SLOTS,
     OPCODE_QUICK_VERIFY_REQUEST,
     OPCODE_QUICK_VERIFY_RESPONSE,
     OPCODE_SET_NAME_REQUEST,
@@ -63,11 +65,13 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
+from ..exceptions import FlicAuthenticationError, FlicProtocolError
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
+    raise_full_verify_failure,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -144,27 +148,39 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
         _LOGGER.debug("FullVerifyRequest1 sent, waiting for FullVerifyResponse1")
 
         # Wait for FullVerifyResponse1
-        response1 = await asyncio.wait_for(
-            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_1),
-            timeout=PAIRING_TIMEOUT,
-        )
+        expected_len = 1 + 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 118 bytes
+        async with asyncio.timeout(PAIRING_TIMEOUT):
+            while True:
+                response1 = await self._wait_for_opcodes(
+                    [OPCODE_FULL_VERIFY_RESPONSE_1, OPCODE_NO_LOGICAL_CONNECTION_SLOTS]
+                )
+                if response1[1] == OPCODE_NO_LOGICAL_CONNECTION_SLOTS:
+                    full_tmp_ids = struct.unpack_from(
+                        f"<{(len(response1) - 2) // 4}I", response1, 2
+                    )
+                    if temp_conn_id in full_tmp_ids:
+                        raise FlicProtocolError(
+                            "The button has no free connection slots, too many "
+                            "apps are connected to it"
+                        )
+                    continue
+
+                if len(response1) < expected_len:
+                    raise FlicProtocolError(
+                        f"Invalid FullVerifyResponse1 length: {len(response1)} "
+                        f"(expected {expected_len})"
+                    )
+                received_tmp_id = struct.unpack_from("<I", response1, 2)[0]
+                if received_tmp_id == temp_conn_id:
+                    break
+                # A late response to an earlier attempt; the official libraries
+                # also ignore it and keep waiting
+                _LOGGER.debug(
+                    "Ignoring FullVerifyResponse1 for tmp_id 0x%08x", received_tmp_id
+                )
         _LOGGER.debug("Received FullVerifyResponse1 (length=%d bytes)", len(response1))
 
-        # Parse FullVerifyResponse1
-        expected_len = 1 + 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 118 bytes
-        if len(response1) < expected_len:
-            raise ValueError(
-                f"Invalid FullVerifyResponse1 length: {len(response1)} (expected {expected_len})"
-            )
-
-        offset = 2  # Skip header and opcode
-        received_tmp_id = struct.unpack("<I", response1[offset : offset + 4])[0]
-        offset += 4
-
-        if received_tmp_id != temp_conn_id:
-            raise ValueError(
-                f"tmpId mismatch: expected {temp_conn_id}, got {received_tmp_id}"
-            )
+        offset = 6  # Skip header, opcode and tmp_id
 
         signature = response1[offset : offset + 64]
         offset += 64
@@ -197,7 +213,9 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             self.ed25519_public_key, signed_data, signature
         )
         if signature_variant is None:
-            raise ValueError("Invalid button signature - all variants failed")
+            raise FlicAuthenticationError(
+                "Invalid button signature - all variants failed"
+            )
 
         _LOGGER.debug("Ed25519 signature verified with variant %d", signature_variant)
 
@@ -239,15 +257,24 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
 
         # Wait for FullVerifyResponse2
         response2_data = await asyncio.wait_for(
-            self._wait_for_opcode(OPCODE_FULL_VERIFY_RESPONSE_2),
+            self._wait_for_opcodes(
+                [OPCODE_FULL_VERIFY_RESPONSE_2, OPCODE_FULL_VERIFY_FAIL_RESPONSE]
+            ),
             timeout=PAIRING_TIMEOUT,
         )
         _LOGGER.debug(
             "Received FullVerifyResponse2 (length=%d bytes)", len(response2_data)
         )
 
+        if response2_data[1] == OPCODE_FULL_VERIFY_FAIL_RESPONSE:
+            reason = response2_data[2] if len(response2_data) > 2 else -1
+            raise_full_verify_failure(reason)
+
         # Parse FullVerifyResponse2
-        response2 = FullVerifyResponse2.from_bytes(response2_data)
+        try:
+            response2 = FullVerifyResponse2.from_bytes(response2_data)
+        except ValueError as err:
+            raise FlicProtocolError(str(err)) from err
         serial_number = response2.serial_number
 
         _LOGGER.debug(

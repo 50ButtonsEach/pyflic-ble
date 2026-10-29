@@ -23,8 +23,11 @@ from ..const import (
     FLIC2_EVENT_UP_CLICK_PENDING,
     FLIC2_EVENT_UP_DOUBLE_CLICK,
     FLIC2_EVENT_UP_SINGLE_CLICK,
+    FULL_VERIFY_FAIL_REASON_INVALID_VERIFIER,
+    FULL_VERIFY_FAIL_REASON_NOT_IN_PUBLIC_MODE,
     PushTwistMode,
 )
+from ..exceptions import FlicAuthenticationError, FlicPairingError
 
 if TYPE_CHECKING:
     from ..rotate_tracker import RotateTracker
@@ -74,6 +77,16 @@ WritePacketFn = Callable[[bytes, bool], Awaitable[None]]
 WaitForOpcodesFn = Callable[[list[int]], Awaitable[bytes]]
 WaitForOpcodeFn = Callable[[int], Awaitable[bytes]]
 WriteGattFn = Callable[[str, bytes], Awaitable[None]]
+
+
+def raise_full_verify_failure(reason: int) -> Never:
+    """Raise the error that matches a FullVerifyFailResponse reason."""
+    if reason == FULL_VERIFY_FAIL_REASON_NOT_IN_PUBLIC_MODE:
+        raise FlicPairingError("The button is not in pairing mode")
+    if reason == FULL_VERIFY_FAIL_REASON_INVALID_VERIFIER:
+        # The button could not validate our verifier: a genuineness failure
+        raise FlicAuthenticationError("The button rejected the pairing verifier")
+    raise FlicPairingError(f"Pairing failed with reason {reason}")
 
 
 async def _unbound_transport(*_args: object, **_kwargs: object) -> Never:

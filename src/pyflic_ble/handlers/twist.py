@@ -80,12 +80,14 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
+from ..exceptions import FlicAuthenticationError, FlicProtocolError
 from ..rotate_tracker import MultiModeRotateTracker
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
     DeviceProtocolHandler,
     RotateEvent,
+    raise_full_verify_failure,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -189,30 +191,33 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         await self._write_gatt(self.write_char_uuid, request1)
         _LOGGER.debug("TwistFullVerifyRequest1 sent, waiting for response")
 
-        response1 = await asyncio.wait_for(
-            self._wait_for_opcode(TWIST_OPCODE_FULL_VERIFY_RESPONSE_1),
-            timeout=PAIRING_TIMEOUT,
-        )
+        # Parse Twist response (no frame header)
+        expected_len = 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 117 bytes
+        async with asyncio.timeout(PAIRING_TIMEOUT):
+            while True:
+                response1 = await self._wait_for_opcode(
+                    TWIST_OPCODE_FULL_VERIFY_RESPONSE_1
+                )
+                if len(response1) < expected_len:
+                    raise FlicProtocolError(
+                        f"Invalid TwistFullVerifyResponse1 length: {len(response1)} "
+                        f"(expected {expected_len})"
+                    )
+                received_tmp_id = struct.unpack_from("<I", response1, 1)[0]
+                if received_tmp_id == temp_conn_id:
+                    break
+                # A late response to an earlier attempt; the official libraries
+                # also ignore it and keep waiting
+                _LOGGER.debug(
+                    "Ignoring TwistFullVerifyResponse1 for tmp_id 0x%08x",
+                    received_tmp_id,
+                )
         _LOGGER.debug(
             "Received TwistFullVerifyResponse1 (length=%d bytes)",
             len(response1),
         )
 
-        # Parse Twist response (no frame header)
-        expected_len = 1 + 4 + 64 + 6 + 1 + 32 + 8 + 1  # 117 bytes
-        if len(response1) < expected_len:
-            raise ValueError(
-                f"Invalid TwistFullVerifyResponse1 length: {len(response1)} (expected {expected_len})"
-            )
-
-        offset = 1  # Skip opcode only
-        received_tmp_id = struct.unpack("<I", response1[offset : offset + 4])[0]
-        offset += 4
-
-        if received_tmp_id != temp_conn_id:
-            raise ValueError(
-                f"tmpId mismatch: expected {temp_conn_id}, got {received_tmp_id}"
-            )
+        offset = 5  # Skip opcode and tmp_id
 
         signature = response1[offset : offset + 64]
         offset += 64
@@ -236,8 +241,9 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             self.ed25519_public_key, signed_data, signature
         )
         if signature_variant is None:
-            _LOGGER.error("Ed25519 verification failed for all variants")
-            raise ValueError("Invalid Twist signature - all variants failed")
+            raise FlicAuthenticationError(
+                "Invalid Twist signature - all variants failed"
+            )
 
         _LOGGER.debug(
             "Twist Ed25519 signature verified with sigBits=%d",
@@ -295,13 +301,13 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         )
 
         if response2_data[0] == TWIST_OPCODE_FULL_VERIFY_FAIL_RESPONSE:
-            reason = response2_data[1] if len(response2_data) > 1 else 0
-            reason_str = {0: "INVALID_VERIFIER", 1: "NOT_IN_PUBLIC_MODE"}.get(
-                reason, f"UNKNOWN({reason})"
-            )
-            raise ValueError(f"Twist pairing failed: {reason_str} (code {reason})")
+            reason = response2_data[1] if len(response2_data) > 1 else -1
+            raise_full_verify_failure(reason)
 
-        response2 = TwistFullVerifyResponse2.from_bytes(response2_data)
+        try:
+            response2 = TwistFullVerifyResponse2.from_bytes(response2_data)
+        except ValueError as err:
+            raise FlicProtocolError(str(err)) from err
 
         _LOGGER.info("Twist paired (serial=%s)", response2.serial_number)
 
