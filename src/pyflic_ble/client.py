@@ -30,7 +30,10 @@ from .const import (
     FRAME_HEADER_CONN_ID_MASK,
     FRAME_HEADER_FRAGMENT_FLAG,
     FRAME_HEADER_NEWLY_ASSIGNED,
+    OPCODE_DISCONNECT_VERIFIED_LINK,
     OPCODE_FIRMWARE_UPDATE_NOTIFICATION,
+    OPCODE_PING_REQUEST,
+    OPCODE_PING_RESPONSE,
     TWIST_DISCONNECT_REASON_INVALID_SIGNATURE,
     TWIST_DISCONNECT_REASON_OTHER_CLIENT,
     TWIST_OPCODE_BUTTON_EVENT,
@@ -1057,6 +1060,33 @@ class FlicClient:
             data = packet_data
 
             # MAC verification is disabled for reliability (matches official SDK behavior)
+
+            if opcode == OPCODE_PING_REQUEST:
+                # The button ends the session when its pings go unanswered
+                self._run_in_background(
+                    self._write_packet(
+                        bytes(
+                            [
+                                self._connection_id & FRAME_HEADER_CONN_ID_MASK,
+                                OPCODE_PING_RESPONSE,
+                            ]
+                        )
+                    )
+                )
+                return
+
+            if opcode == OPCODE_DISCONNECT_VERIFIED_LINK:
+                _LOGGER.warning(
+                    "%s ended the verified session: reason=%d",
+                    self.address,
+                    data[2] if len(data) > 2 else -1,
+                )
+                self._state = SessionState.DISCONNECTED
+                # Dropping the link runs the normal disconnect handling, which
+                # marks the button unavailable and reconnects
+                if self._client is not None:
+                    self._run_in_background(self._client.disconnect())
+                return
 
         # Delegate to handler for event processing
         button_events, rotate_events, _selector_index = (

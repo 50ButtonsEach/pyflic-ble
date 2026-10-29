@@ -9,6 +9,7 @@ import time
 from typing import Final
 
 from ..const import (
+    AUTO_DISCONNECT_TIME_NEVER,
     COMMAND_TIMEOUT,
     DUO_FIRMWARE_DATA_CHUNK_SIZE,
     DUO_FIRMWARE_MAX_IN_FLIGHT,
@@ -131,7 +132,7 @@ class DuoProtocolHandler(Flic2ProtocolHandler):
             event_count_0=0,
             event_count_1=0,
             boot_id=0,
-            auto_disconnect_time=0,
+            auto_disconnect_time=AUTO_DISCONNECT_TIME_NEVER,
             max_queued_packets=30,
             max_queued_packets_age=60,
         )

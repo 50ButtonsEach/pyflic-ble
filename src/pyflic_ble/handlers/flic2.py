@@ -10,6 +10,7 @@ import struct
 import time
 
 from ..const import (
+    AUTO_DISCONNECT_TIME_NEVER,
     COMMAND_TIMEOUT,
     FIRMWARE_FINAL_ACK_TIMEOUT,
     FIRMWARE_UPDATE_TIMEOUT,
@@ -372,7 +373,7 @@ class Flic2ProtocolHandler(DeviceProtocolHandler):
             connection_id=self._connection_id,
             event_count=self._event_count,
             boot_id=self._boot_id,
-            auto_disconnect_time=0,
+            auto_disconnect_time=AUTO_DISCONNECT_TIME_NEVER,
             max_queued_packets=30,
             max_queued_packets_age=60,
         )
