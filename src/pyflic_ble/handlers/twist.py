@@ -80,7 +80,7 @@ from ..security import (
     verify_ed25519_signature_with_variant,
     x25519_key_exchange,
 )
-from ..rotate_tracker import D360, MultiModeRotateTracker
+from ..rotate_tracker import MultiModeRotateTracker
 from .base import (
     ButtonEvent,
     DeviceCapabilities,
@@ -113,7 +113,12 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self._twist_mode_index: int = 0
         self._twist_packet_counter: int = 0
         self._push_twist_mode = push_twist_mode
-        self._multi_mode_tracker: MultiModeRotateTracker | None = None
+        self._multi_mode_tracker = MultiModeRotateTracker(
+            bound_mode_12=(
+                push_twist_mode in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
+            ),
+            wrap_position=(push_twist_mode == PushTwistMode.CONTINUOUS),
+        )
         self._last_event_count: int = 0
         self._last_boot_id: int = 0
         self._prev_int_pct: dict[int, int] = {}
@@ -373,20 +378,10 @@ class TwistProtocolHandler(DeviceProtocolHandler):
     ) -> None:
         """Initialize button events for Flic Twist."""
         # The device does not persist rotation positions across a connection; the
-        # hub restores them through the position field below. Keep the existing
-        # tracker so a reconnect resumes where the dial actually is.
-        if self._multi_mode_tracker is None:
-            self._multi_mode_tracker = MultiModeRotateTracker(
-                bound_mode_12=(
-                    self._push_twist_mode
-                    in (PushTwistMode.DEFAULT, PushTwistMode.CONTINUOUS)
-                ),
-                wrap_position=(self._push_twist_mode == PushTwistMode.CONTINUOUS),
-            )
-
+        # hub restores them through the position field below. Keep the tracker
+        # across reconnects so a reconnect resumes where the dial actually is.
         positions = [
-            int(self._multi_mode_tracker.get_mode_percentage(index) / 100.0 * D360)
-            for index in range(13)
+            self._multi_mode_tracker.get_mode_units(index) for index in range(13)
         ]
 
         # Build 13 mode configs based on push_twist_mode setting
@@ -446,6 +441,11 @@ class TwistProtocolHandler(DeviceProtocolHandler):
             api_version=2,
         )
         request = request_msg.to_bytes()
+
+        # The device re-bases every mode on this request, and rotation updates can
+        # arrive before the write returns
+        for index, position in enumerate(positions):
+            self._multi_mode_tracker.rebase(index, position)
 
         _LOGGER.debug(
             "Sending InitButtonEventsTwistRequest (%d bytes)",
@@ -696,17 +696,12 @@ class TwistProtocolHandler(DeviceProtocolHandler):
         self, mode_index: int, desired_position: int
     ) -> bytes:
         """Build an UpdateTwistPositionRequest."""
-        absolute_position = 0
-        if self._multi_mode_tracker is not None:
-            absolute_position = self._multi_mode_tracker.get_absolute_position(
-                mode_index
-            )
+        absolute_position = self._multi_mode_tracker.get_absolute_position(mode_index)
 
         new_min = absolute_position - desired_position
 
-        if self._multi_mode_tracker is not None:
-            # Update local min to match what the device will have
-            self._multi_mode_tracker.set_mode_min(mode_index, new_min)
+        # Update local min to match what the device will have
+        self._multi_mode_tracker.set_mode_min(mode_index, new_min)
 
         request = UpdateTwistPositionRequest(
             twist_mode_index=mode_index,
@@ -843,12 +838,6 @@ class TwistProtocolHandler(DeviceProtocolHandler):
     def _parse_twist_rotation_event(self, event_data: bytes) -> list[RotateEvent]:
         """Parse Twist rotation event."""
         events: list[RotateEvent] = []
-
-        if self._multi_mode_tracker is None:
-            _LOGGER.warning(
-                "Twist rotation event received but rotate tracker not initialized"
-            )
-            return events
 
         try:
             notification = TwistEventNotification.from_bytes(event_data)

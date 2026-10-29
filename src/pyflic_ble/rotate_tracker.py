@@ -276,17 +276,30 @@ class MultiModeRotateTracker:
 
         return result
 
-    def get_mode_percentage(self, mode_index: int) -> float:
-        """Get bounded position as 0-100% for a mode."""
+    def get_mode_units(self, mode_index: int) -> int:
+        """Get bounded position in units (0..D360) for a mode."""
         if 0 <= mode_index < 13:
             if self._wrap_position:
                 # Use raw position with modulo for continuous wrapping
-                wrapped_units = self._positions[mode_index] % D360
-                return (wrapped_units / D360) * 100.0
+                return self._positions[mode_index] % D360
             bounded = self._positions[mode_index] - self._mins[mode_index]
-            raw_percentage = (bounded / D360) * 100.0
-            return max(0.0, min(100.0, raw_percentage))
-        return 0.0
+            return max(0, min(D360, bounded))
+        return 0
+
+    def get_mode_percentage(self, mode_index: int) -> float:
+        """Get bounded position as 0-100% for a mode."""
+        return (self.get_mode_units(mode_index) / D360) * 100.0
+
+    def rebase(self, mode_index: int, units: int) -> None:
+        """Restart a mode at the position the device was initialized with.
+
+        The device resets every mode to min 0 and the sent position on each
+        InitButtonEvents, so later deltas and position writes use that frame.
+        """
+        if 0 <= mode_index < 13:
+            self._positions[mode_index] = units
+            self._mins[mode_index] = 0
+            self._trackers[mode_index].set_accumulated_units(units)
 
     def get_absolute_position(self, mode_index: int) -> int:
         """Get absolute (unbounded) position for a mode."""
